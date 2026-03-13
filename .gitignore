@@ -1,0 +1,22 @@
+# LogSense AI Root .gitignore
+
+# ── Backend ──
+backend/logs.db
+backend/venv/
+backend/__pycache__/
+*.py[cod]
+*$py.class
+backend/ai_engine_draft.py
+
+# ── Environments ──
+.env
+.env.local
+.env.*
+
+# ── OS specifics ──
+.DS_Store
+Thumbs.db
+
+# ── IDEs ──
+.vscode/
+.idea/

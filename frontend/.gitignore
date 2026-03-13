@@ -32,15 +32,6 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
-backend/.env
-
-# Backend specific
-backend/logs.db
-backend/venv/
-backend/__pycache__/
-*.pyc
-*.pyo
-*.pyd
 
 # typescript
 *.tsbuildinfo
