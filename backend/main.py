@@ -31,23 +31,15 @@ from sqlmodel import Session, select
 load_dotenv()
 
 # ──────────────────────────────────────────────
-# Loguru Yapılandırması
+# Logging Yapılandırması (Sadece Konsol)
 # ──────────────────────────────────────────────
 logger.remove()
 logger.add(
-    sink=lambda msg: print(msg, end=""),
-    format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan> - <level>{message}</level>",
-    colorize=True,
-    level="DEBUG",
+    sys.stderr,
+    format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{message}</cyan>",
+    level="INFO"
 )
-logger.add(
-    "logs/logsense.log",
-    rotation="10 MB",
-    retention="7 days",
-    compression="zip",
-    level="INFO",
-    format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name} - {message}",
-)
+logger.info("🚀 LogSense AI başlatılıyor... (Sadece Konsol Loglama Aktif)")
 
 # ──────────────────────────────────────────────
 # Güvenlik — API Key
@@ -196,17 +188,22 @@ async def _process_log_background(log_data: dict):
         with Session(engine) as session:
             db_log = LogModel(**{k: v for k, v in log_data.items() if k != "_ts"})
             session.add(db_log)
+            session.commit()
+            session.refresh(db_log)
+            log_data["id"] = db_log.id
 
             ai_result = log_data.get("ai_analysis", {})
             if ai_result.get("ml_prediction") == "anomaly":
                 db_alert = AlertModel(
-                    log_id=0,
+                    log_id=db_log.id,
                     level=log_data["level"],
                     source=log_data["source"],
                     message=log_data["message"],
                     timestamp=log_data["timestamp"]
                 )
                 session.add(db_alert)
+                session.commit()
+                logger.info(f"🔔 Yeni Alert oluşturuldu: #{db_log.id}")
 
             if correlation_group:
                 stmt = select(CorrelationModel).where(
@@ -220,9 +217,9 @@ async def _process_log_background(log_data: dict):
                 else:
                     db_corr = CorrelationModel(**correlation_group)
                     session.add(db_corr)
+                session.commit()
 
-            session.commit()
-            logger.info(f"💾 Kaydedildi: [{log_data['level']}] {log_data['source']} — {log_data['message'][:60]}")
+            logger.info(f"💾 Kaydedildi: [ID:{db_log.id}] [{log_data['level']}] {log_data['source']} — {log_data['message'][:60]}")
     except Exception as e:
         logger.error(f"Veritabanı hatası: {e}")
 

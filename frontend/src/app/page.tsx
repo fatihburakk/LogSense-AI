@@ -7,6 +7,13 @@ import {
 } from "recharts";
 
 // ──────────────────────────────────────────────
+// Configuration from Environment
+// ──────────────────────────────────────────────
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000";
+const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://127.0.0.1:8000";
+const API_KEY = process.env.NEXT_PUBLIC_LOGSENSE_API_KEY || "";
+
+// ──────────────────────────────────────────────
 // Types & Constants
 // ──────────────────────────────────────────────
 interface EnrichmentData {
@@ -22,12 +29,24 @@ interface AIAnalysis {
   llm_analysis: string | null;
 }
 interface LogEntry {
+  id?: number;
   timestamp: string;
   level: string;
   message: string;
   source: string;
   ai_analysis?: AIAnalysis;
   enrichment?: EnrichmentData;
+}
+interface AlertEntry {
+  id: number;
+  log_id: number;
+  level: string;
+  source: string;
+  message: string;
+  timestamp: string;
+  is_resolved: boolean;
+  is_false_positive: boolean;
+  ai_analysis?: AIAnalysis; // UI hint
 }
 interface CorrelationGroup {
   group_id: string;
@@ -61,7 +80,13 @@ function useWebSocket(url: string) {
       ws.onmessage = (e) => {
         const p = JSON.parse(e.data);
         if (p.type === "history") setLogs(p.data.reverse());
-        else if (p.type === "log") setLogs((prev) => [p.data, ...prev.slice(0, 999)]);
+        else if (p.type === "log") {
+          setLogs((prev) => [p.data, ...prev.slice(0, 999)]);
+          // If it's an anomaly, notify Dashboard to refresh alerts
+          if (p.data.ai_analysis?.ml_prediction === "anomaly") {
+             window.dispatchEvent(new CustomEvent('new-alert', { detail: p.data }));
+          }
+        }
         else if (p.type === "correlation") {
           window.dispatchEvent(new CustomEvent('new-correlation', { detail: p.data }));
         }
@@ -106,7 +131,7 @@ function buildChart(logs: LogEntry[]): ChartPoint[] {
 // Dashboard
 // ──────────────────────────────────────────────
 export default function Dashboard() {
-  const { logs, connected, clearLogs } = useWebSocket("ws://127.0.0.1:8000/ws/logs");
+  const { logs, connected, clearLogs } = useWebSocket(`${WS_URL}/ws/logs`);
   const [activeTab, setActiveTab] = useState<"overview" | "logs" | "ai" | "correlations">("overview");
   const [sending, setSending] = useState(false);
 
@@ -118,8 +143,36 @@ export default function Dashboard() {
   const [logPage, setLogPage] = useState(1);
   const [alertPage, setAlertPage] = useState(1);
 
-  // Correlations State
+  // Alerts & Correlations State
   const [correlations, setCorrelations] = useState<CorrelationGroup[]>([]);
+  const [alerts, setAlerts] = useState<AlertEntry[]>([]);
+
+  const fetchAlerts = useCallback(async () => {
+    try {
+      const resp = await fetch(`${API_URL}/api/alerts?only_open=true`);
+      const data = await resp.json();
+      if (Array.isArray(data)) setAlerts(data);
+    } catch (e) {
+      console.error("Error fetching alerts:", e);
+    }
+  }, []);
+
+  const fetchCorrelations = useCallback(async () => {
+    try {
+      const resp = await fetch(`${API_URL}/api/history/correlations`);
+      const data = await resp.json();
+      if (Array.isArray(data)) setCorrelations(data);
+    } catch (e) {
+      console.error("Error fetching correlation history:", e);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchAlerts();
+    fetchCorrelations();
+  }, [fetchAlerts, fetchCorrelations]);
+
+  // Handle incoming live alerts/correlations
   useEffect(() => {
     const handleCorrelation = (e: any) => {
       setCorrelations(prev => {
@@ -132,26 +185,20 @@ export default function Dashboard() {
         return [e.detail, ...prev].sort((a, b) => a.age_seconds - b.age_seconds);
       });
     };
-    window.addEventListener('new-correlation', handleCorrelation);
-    return () => window.removeEventListener('new-correlation', handleCorrelation);
-  }, []);
+    const handleNewAlert = () => fetchAlerts();
 
-  // Fetch initial correlations from database on load
-  useEffect(() => {
-    fetch('http://127.0.0.1:8000/api/history/correlations')
-      .then(r => r.json())
-      .then(data => {
-        if (Array.isArray(data)) setCorrelations(data);
-      })
-      .catch(e => console.error("Error fetching correlation history:", e));
-  }, []);
+    window.addEventListener('new-correlation', handleCorrelation);
+    window.addEventListener('new-alert', handleNewAlert);
+    return () => {
+      window.removeEventListener('new-correlation', handleCorrelation);
+      window.removeEventListener('new-alert', handleNewAlert);
+    };
+  }, [fetchAlerts]);
 
   // Modals
   const [selectedLog, setSelectedLog] = useState<LogEntry | null>(null);
-  const [selectedAlert, setSelectedAlert] = useState<LogEntry | null>(null);
+  const [selectedAlert, setSelectedAlert] = useState<AlertEntry | null>(null);
   const [selectedCorrelation, setSelectedCorrelation] = useState<CorrelationGroup | null>(null);
-  const [resolvedAlerts, setResolvedAlerts] = useState<Set<number>>(new Set());
-  const [falsePositives, setFalsePositives] = useState<Set<number>>(new Set());
 
   useEffect(() => {
     document.body.style.overflow = (selectedLog || selectedAlert || selectedCorrelation) ? "hidden" : "";
@@ -180,25 +227,17 @@ export default function Dashboard() {
     info: logs.filter(l => l.level === "INFO").length,
     warn: logs.filter(l => l.level === "WARN").length,
     error: logs.filter(l => l.level === "ERROR" || l.level === "CRITICAL").length,
-    anomalies: logs.filter(l => l.ai_analysis?.ml_prediction === "anomaly").length,
-  }), [logs]);
+    anomalies: alerts.length,
+  }), [logs, alerts]);
 
-  const allAlerts = useMemo(() =>
-    logs.map((log, idx) => ({ log, idx }))
-      .filter(({ log, idx }) =>
-        (log.ai_analysis?.ml_prediction === "anomaly" || log.level === "ERROR" || log.level === "CRITICAL") &&
-        !resolvedAlerts.has(idx) && !falsePositives.has(idx)
-      ).reverse()
-    , [logs, resolvedAlerts, falsePositives]);
-
-  const filteredAlerts = useMemo(() => allAlerts.filter(({ log }) => {
-    if (sourceFilter !== "all" && log.source !== sourceFilter) return false;
+  const filteredAlerts = useMemo(() => alerts.filter((alert) => {
+    if (sourceFilter !== "all" && alert.source !== sourceFilter) return false;
     if (searchQuery) {
       const q = searchQuery.toLowerCase();
-      if (!log.message.toLowerCase().includes(q)) return false;
+      if (!alert.message.toLowerCase().includes(q)) return false;
     }
     return true;
-  }), [allAlerts, sourceFilter, searchQuery]);
+  }), [alerts, sourceFilter, searchQuery]);
 
   const totalAlertPages = Math.max(1, Math.ceil(filteredAlerts.length / ALERTS_PER_PAGE));
   useEffect(() => { if (alertPage > totalAlertPages) setAlertPage(1); }, [totalAlertPages, alertPage]);
@@ -206,8 +245,32 @@ export default function Dashboard() {
 
   const chartData = useMemo(() => buildChart(logs), [logs]);
 
-  const resolveAlert = (idx: number) => { setResolvedAlerts(p => new Set(p).add(idx)); setSelectedAlert(null); };
-  const markFalse = (idx: number) => { setFalsePositives(p => new Set(p).add(idx)); setSelectedAlert(null); };
+  // ──── Persistent Alert Actions ────
+  const resolveAlert = async (id: number) => {
+    try {
+      await fetch(`${API_URL}/api/alerts/${id}/resolve`, {
+        method: "PATCH",
+        headers: { "X-API-KEY": API_KEY }
+      });
+      setAlerts(prev => prev.filter(a => a.id !== id));
+      setSelectedAlert(null);
+    } catch (e) {
+      console.error("Failed to resolve alert:", e);
+    }
+  };
+
+  const markFalse = async (id: number) => {
+    try {
+      await fetch(`${API_URL}/api/alerts/${id}/false-positive`, {
+        method: "PATCH",
+        headers: { "X-API-KEY": API_KEY }
+      });
+      setAlerts(prev => prev.filter(a => a.id !== id));
+      setSelectedAlert(null);
+    } catch (e) {
+      console.error("Failed to mark false positive:", e);
+    }
+  };
 
   const triggerError = async () => {
     setSending(true);
@@ -219,7 +282,16 @@ export default function Dashboard() {
       { level: "CRITICAL", message: "InnoDB: Fatal error: ib_logfile0 is of different size", source: "mysql" },
     ];
     for (const err of errors) {
-      try { await fetch("http://127.0.0.1:8000/api/logs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...err, timestamp: new Date().toISOString() }) }); } catch { }
+      try {
+        await fetch(`${API_URL}/api/logs`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-API-KEY": API_KEY
+          },
+          body: JSON.stringify({ ...err, timestamp: new Date().toISOString() })
+        });
+      } catch { }
       await new Promise(r => setTimeout(r, 500));
     }
     setSending(false);
@@ -263,7 +335,7 @@ export default function Dashboard() {
           <div className="sidebar-logo">🔍</div>
           <div>
             <h1 className="sidebar-title">LogSense AI</h1>
-            <p className="sidebar-version">v2.0 — SaaS Edition</p>
+            <p className="sidebar-version">v2.2 — Managed</p>
           </div>
         </div>
 
@@ -374,7 +446,7 @@ export default function Dashboard() {
                   {paginatedLogs.length === 0 ? (
                     <div className="terminal-empty"><span className="empty-icon">📡</span><p>Log akışı bekleniyor...</p><code>python producer.py</code></div>
                   ) : paginatedLogs.map((log, i) => (
-                    <div key={`${logPage}-${i}`} className={`log-line-v2 ${log.level}`} onClick={() => setSelectedLog(log)}>
+                    <div key={log.id || i} className={`log-line-v2 ${log.level}`} onClick={() => setSelectedLog(log)}>
                       <span className="ll-time">{fmtTime(log.timestamp)}</span>
                       <span className={`ll-level ${log.level}`}>{log.level}</span>
                       <span className="ll-source">{log.source}</span>
@@ -412,36 +484,18 @@ export default function Dashboard() {
               <div className="ai-grid">
                 {paginatedAlerts.length === 0 ? (
                   <div className="ai-empty"><span className="ai-empty-icon">🧠</span><h3>Sistem Temiz</h3><p>Anomali tespit edilmedi. AI motoru altyapınızı sürekli tarıyor.</p></div>
-                ) : paginatedAlerts.map(({ log: alert, idx }) => (
-                  <div key={idx} className={`ai-card ${alert.level}`} onClick={() => setSelectedAlert(alert)}>
+                ) : paginatedAlerts.map((alert) => (
+                  <div key={alert.id} className={`ai-card ${alert.level}`} onClick={() => setSelectedAlert(alert)}>
                     <div className="ai-card-top">
                       <span className={`ai-level-tag ${alert.level}`}>{alert.level === "CRITICAL" ? "💀" : "🔴"} {alert.level}</span>
                       <span className="ai-card-source">{alert.source}</span>
-                      {alert.enrichment?.error_category && (
-                        <span style={{ fontSize: '0.65rem', background: 'rgba(255,255,255,0.05)', padding: '2px 6px', borderRadius: 4, color: 'var(--text-secondary)' }}>
-                          {alert.enrichment.error_category.category}
-                        </span>
-                      )}
                       <span className="ai-card-time">{fmtTime(alert.timestamp)}</span>
                     </div>
                     <div className="ai-card-message">{alert.message}</div>
-                    {alert.ai_analysis && (
-                      <div className="ai-inline-analysis">
-                        <div className="ai-inline-header">
-                          <span>🧠 ML Model Analizi</span>
-                          <span className="ai-inline-score">{alert.ai_analysis.model_used} — {(alert.ai_analysis.anomaly_score * 100).toFixed(0)}%</span>
-                        </div>
-                        <div className="ai-inline-body">
-                          {alert.ai_analysis.llm_analysis || "Derinlemesine analiz ediliyor..."}
-                        </div>
-                        <div className="anomaly-score-bar">
-                          <div className={`anomaly-score-fill ${scoreLevel(alert.ai_analysis.anomaly_score)}`} style={{ width: `${alert.ai_analysis.anomaly_score * 100}%` }} />
-                        </div>
-                      </div>
-                    )}
+                    {/* Note: Fetch linked log's AI analysis for display in card if needed, or rely on alert message */}
                     <div className="ai-card-actions">
-                      <button className="action-btn resolve" onClick={e => { e.stopPropagation(); resolveAlert(idx); }}>✅ Çözüldü</button>
-                      <button className="action-btn false-pos" onClick={e => { e.stopPropagation(); markFalse(idx); }}>🚫 Hatalı Alarm</button>
+                      <button className="action-btn resolve" onClick={e => { e.stopPropagation(); resolveAlert(alert.id); }}>✅ Çözüldü</button>
+                      <button className="action-btn false-pos" onClick={e => { e.stopPropagation(); markFalse(alert.id); }}>🚫 Hatalı Alarm</button>
                     </div>
                   </div>
                 ))}
@@ -486,7 +540,7 @@ export default function Dashboard() {
         </main>
       </div>
 
-      {/* ═══════ MODAL: Log Detail (Restored Rich Design) ═══════ */}
+      {/* ═══════ MODAL: Log Detail ═══════ */}
       {selectedLog && (
         <div className="modal-overlay" onClick={() => setSelectedLog(null)}>
           <div className="modal-content" onClick={e => e.stopPropagation()}>
@@ -495,12 +549,12 @@ export default function Dashboard() {
               <button className="modal-close" onClick={() => setSelectedLog(null)}>✕</button>
             </div>
             <div className="modal-body">
+              <div className="modal-field"><span className="modal-label">ID</span><span className="modal-value">{selectedLog.id || "Pending"}</span></div>
               <div className="modal-field"><span className="modal-label">Zaman</span><span className="modal-value">{selectedLog.timestamp}</span></div>
               <div className="modal-field"><span className="modal-label">Seviye</span><span className={`log-level-badge ${selectedLog.level}`}>{selectedLog.level}</span></div>
               <div className="modal-field"><span className="modal-label">Kaynak</span><span className="modal-value">{selectedLog.source}</span></div>
               <div className="modal-field"><span className="modal-label">Mesaj</span><span className="modal-value message-full">{selectedLog.message}</span></div>
 
-              {/* ENRICHMENT DATA */}
               {selectedLog.enrichment && (
                 <>
                   <div className="modal-divider"></div>
@@ -514,15 +568,9 @@ export default function Dashboard() {
                       {selectedLog.enrichment.ip_info.ip} — {selectedLog.enrichment.ip_info.city}, {selectedLog.enrichment.ip_info.country} ({selectedLog.enrichment.ip_info.risk_level} risk)
                     </span></div>
                   )}
-
                   {selectedLog.enrichment.http_info && (
                     <div className="modal-field"><span className="modal-label">HTTP</span><span className="modal-value">
                       <span style={{ fontWeight: 700, color: selectedLog.enrichment.http_info.severity === 'info' ? 'var(--accent-green)' : selectedLog.enrichment.http_info.severity === 'warning' ? 'var(--accent-yellow)' : 'var(--accent-red)' }}>{selectedLog.enrichment.http_info.code}</span> — {selectedLog.enrichment.http_info.type}: {selectedLog.enrichment.http_info.desc}
-                    </span></div>
-                  )}
-                  {selectedLog.enrichment.error_category && (
-                    <div className="modal-field"><span className="modal-label">Kategori</span><span className="modal-value" style={{ color: 'var(--accent-cyan)' }}>
-                      {selectedLog.enrichment.error_category.category} ({selectedLog.enrichment.error_category.domain})
                     </span></div>
                   )}
                 </>
@@ -531,7 +579,6 @@ export default function Dashboard() {
               {selectedLog.ai_analysis && (
                 <>
                   <div className="modal-divider"></div>
-                  <div className="modal-field"><span className="modal-label">Model</span><span className="modal-value">{selectedLog.ai_analysis.model_used}</span></div>
                   <div className="modal-field"><span className="modal-label">Tahmin</span><span className={`log-anomaly-badge ${selectedLog.ai_analysis.ml_prediction}`}>{selectedLog.ai_analysis.ml_prediction === "anomaly" ? "⚠ ANOMALİ" : "✓ Normal"}</span></div>
                   <div className="modal-field"><span className="modal-label">Skor</span><span className="modal-value">{(selectedLog.ai_analysis.anomaly_score * 100).toFixed(1)}%</span></div>
                   {selectedLog.ai_analysis.llm_analysis && (
@@ -539,14 +586,12 @@ export default function Dashboard() {
                   )}
                 </>
               )}
-              <div className="modal-divider"></div>
-              <div className="modal-raw"><span className="modal-label">Ham JSON</span><pre className="modal-json">{JSON.stringify(selectedLog, null, 2)}</pre></div>
             </div>
           </div>
         </div>
       )}
 
-      {/* ═══════ MODAL: Anomaly Deep Dive (Restored Rich Design) ═══════ */}
+      {/* ═══════ MODAL: Anomaly Deep Dive ═══════ */}
       {selectedAlert && (
         <div className="modal-overlay" onClick={() => setSelectedAlert(null)}>
           <div className="modal-content alert-modal" onClick={e => e.stopPropagation()}>
@@ -561,38 +606,10 @@ export default function Dashboard() {
                 <div className="alert-popup-time">{fmtTime(selectedAlert.timestamp)}</div>
               </div>
               <div className="alert-popup-message">{selectedAlert.message}</div>
-              {selectedAlert.ai_analysis && (
-                <>
-                  <div className="modal-divider"></div>
-                  <div className="alert-popup-ml-section">
-                    <div className="alert-popup-ml-title">🤖 ML Model Analizi</div>
-                    <div className="alert-popup-ml-grid">
-                      <div className="alert-popup-ml-item"><span className="alert-popup-ml-label">Model</span><span className="alert-popup-ml-value">{selectedAlert.ai_analysis.model_used}</span></div>
-                      <div className="alert-popup-ml-item"><span className="alert-popup-ml-label">Tahmin</span><span className={`log-anomaly-badge ${selectedAlert.ai_analysis.ml_prediction}`}>{selectedAlert.ai_analysis.ml_prediction === "anomaly" ? "⚠ ANOMALİ" : "✓ Normal"}</span></div>
-                      <div className="alert-popup-ml-item"><span className="alert-popup-ml-label">Skor</span><span className="alert-popup-ml-value">{(selectedAlert.ai_analysis.anomaly_score * 100).toFixed(1)}%</span></div>
-                    </div>
-                    <div className="anomaly-score-bar" style={{ marginTop: 10 }}>
-                      <div className={`anomaly-score-fill ${scoreLevel(selectedAlert.ai_analysis.anomaly_score)}`} style={{ width: `${selectedAlert.ai_analysis.anomaly_score * 100}%` }} />
-                    </div>
-                  </div>
-                  <div className="modal-divider"></div>
-                  <div className="alert-popup-llm-section">
-                    <div className="alert-popup-llm-title">🧠 AI Yorumu (GPT-4o)</div>
-                    {selectedAlert.ai_analysis.llm_analysis ? (
-                      <div className="alert-popup-llm-content">{selectedAlert.ai_analysis.llm_analysis}</div>
-                    ) : (
-                      <div className="alert-popup-llm-empty">
-                        <span>⚠️ LLM analizi mevcut değil.</span>
-                        <span className="alert-popup-llm-hint">Olası nedenler: OPENAI_API_KEY eksik, anomali skoru eşiğin altında veya API zaman aşımı.</span>
-                      </div>
-                    )}
-                  </div>
-                </>
-              )}
               <div className="modal-divider"></div>
               <div className="alert-popup-actions">
-                <button className="alert-popup-action-btn resolve" onClick={() => { const i = logs.indexOf(selectedAlert); if (i !== -1) resolveAlert(i); }}>✅ Çözüldü İşaretle</button>
-                <button className="alert-popup-action-btn false-positive" onClick={() => { const i = logs.indexOf(selectedAlert); if (i !== -1) markFalse(i); }}>🚫 Hatalı Alarm İşaretle</button>
+                <button className="alert-popup-action-btn resolve" onClick={() => resolveAlert(selectedAlert.id)}>✅ Çözüldü İşaretle</button>
+                <button className="alert-popup-action-btn false-positive" onClick={() => markFalse(selectedAlert.id)}>🚫 Hatalı Alarm İşaretle</button>
               </div>
             </div>
           </div>
@@ -604,50 +621,32 @@ export default function Dashboard() {
         <div className="modal-overlay" onClick={() => setSelectedCorrelation(null)}>
           <div className="modal-content" onClick={e => e.stopPropagation()} style={{ maxWidth: 720 }}>
             <div className="modal-header" style={{ background: 'linear-gradient(135deg, rgba(57,210,192,0.1), rgba(13,17,23,0.8))' }}>
-              <span className="modal-title" style={{ color: 'var(--accent-cyan)' }}>🔗 Event Correlation: {selectedCorrelation.group_id}</span>
+              <span className="modal-title" style={{ color: 'var(--accent-cyan)' }}>🔗 Korelasyon: {selectedCorrelation.group_id}</span>
               <button className="modal-close" onClick={() => setSelectedCorrelation(null)}>✕</button>
             </div>
             <div className="modal-body">
               <div style={{ padding: '12px 16px', background: 'var(--bg-terminal)', borderRadius: 8, border: '1px solid var(--border-primary)', marginBottom: 8 }}>
-                <div style={{ fontSize: '0.75rem', color: 'var(--text-dim)', textTransform: 'uppercase', marginBottom: 4 }}>Nedensellik Zinciri Tespit Edildi</div>
                 <div style={{ fontSize: '0.95rem', fontWeight: 600, color: 'var(--text-primary)' }}>{selectedCorrelation.chain_label}</div>
               </div>
-
               {selectedCorrelation.impact_summary && (
                 <div style={{ padding: '12px 16px', background: 'rgba(240,136,62,0.05)', borderRadius: 8, border: '1px solid rgba(240,136,62,0.15)', borderLeft: '3px solid var(--accent-orange)' }}>
-                  <div style={{ fontSize: '0.75rem', fontWeight: 700, color: 'var(--accent-orange)', marginBottom: 6 }}>Zincir Etkisi Zaman Çizelgesi</div>
                   <div style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>{selectedCorrelation.impact_summary}</div>
                 </div>
               )}
-
               <div className="modal-divider" style={{ margin: '12px 0' }}></div>
-              <div style={{ fontSize: '0.85rem', fontWeight: 600, marginBottom: 8, color: 'var(--text-primary)' }}>Olayların Zaman Çizelgesi ({selectedCorrelation.events.length})</div>
-
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 8, maxHeight: 300, overflowY: 'auto', paddingRight: 4 }}>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8, maxHeight: 300, overflowY: 'auto' }}>
                 {selectedCorrelation.events.map((evt, i) => (
-                  <div key={i} style={{ display: 'flex', gap: 12, padding: '10px 12px', background: 'var(--bg-card-hover)', borderRadius: 6, border: '1px solid var(--border-primary)', alignItems: 'flex-start' }}>
-                    <div style={{ width: 60, flexShrink: 0, textAlign: 'center' }}>
-                      <span style={{
-                        fontSize: '0.6rem', fontWeight: 800, textTransform: 'uppercase', padding: '2px 6px', borderRadius: 4,
-                        background: evt.role === 'trigger' ? 'rgba(248,81,73,0.15)' : evt.role === 'cause' ? 'rgba(210,153,34,0.15)' : 'rgba(88,166,255,0.15)',
-                        color: evt.role === 'trigger' ? 'var(--accent-red)' : evt.role === 'cause' ? 'var(--accent-yellow)' : 'var(--accent-blue)'
-                      }}>{evt.role}</span>
-                    </div>
-                    <div style={{ flex: 1 }}>
+                  <div key={i} style={{ display: 'flex', gap: 12, padding: '10px 12px', background: 'var(--bg-card-hover)', borderRadius: 6, border: '1px solid var(--border-primary)' }}>
+                     <div style={{ flex: 1 }}>
                       <div style={{ display: 'flex', gap: 8, marginBottom: 4, alignItems: 'center' }}>
                         <span style={{ fontSize: '0.7rem', color: 'var(--text-dim)' }}>{fmtTime(evt.timestamp)}</span>
                         <span className={`log-level-badge ${evt.level}`} style={{ fontSize: '0.6rem' }}>{evt.level}</span>
                         <span style={{ fontSize: '0.7rem', color: 'var(--accent-purple)', fontWeight: 600 }}>{evt.source}</span>
                       </div>
-                      <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', fontFamily: 'JetBrains Mono, monospace', wordBreak: 'break-word' }}>{evt.message}</div>
+                      <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>{evt.message}</div>
                     </div>
                   </div>
                 ))}
-              </div>
-
-              <div className="modal-divider" style={{ margin: '12px 0' }}></div>
-              <div className="alert-popup-actions">
-                <button className="alert-popup-action-btn resolve" style={{ background: 'rgba(57,210,192,0.1)', borderColor: 'var(--accent-cyan)', color: 'var(--accent-cyan)' }} onClick={() => setSelectedCorrelation(null)}>Korelasyonu Onayla</button>
               </div>
             </div>
           </div>

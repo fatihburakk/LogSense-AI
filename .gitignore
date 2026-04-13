@@ -12,6 +12,8 @@ backend/ai_engine_draft.py
 .env
 .env.local
 .env.*
+backend/.env
+frontend/.env.local
 
 # ── OS specifics ──
 .DS_Store
@@ -20,3 +22,4 @@ Thumbs.db
 # ── IDEs ──
 .vscode/
 .idea/
+
