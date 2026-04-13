@@ -11,10 +11,16 @@ Kullanım:
 import random
 import time
 import argparse
+import os
 import json
 from datetime import datetime, timezone
 
 import httpx
+from dotenv import load_dotenv
+
+load_dotenv()
+
+API_KEY = os.getenv("LOGSENSE_API_KEY", "")
 
 
 # ──────────────────────────────────────────────
@@ -212,9 +218,15 @@ def generate_log() -> dict:
 
 
 def send_log(url: str, log_data: dict) -> bool:
-    """Logu backend'e POST eder."""
+    """Logu backend'e POST eder. X-API-KEY header ile gönderir."""
+    headers = {"Content-Type": "application/json"}
+    if API_KEY:
+        headers["X-API-KEY"] = API_KEY
     try:
-        response = httpx.post(url, json=log_data, timeout=5.0)
+        response = httpx.post(url, json=log_data, headers=headers, timeout=5.0)
+        if response.status_code == 403:
+            print(f"⚠️  API Key reddedildi (403). LOGSENSE_API_KEY değişkenini kontrol et.")
+            return False
         return response.status_code == 200
     except httpx.ConnectError:
         print(f"⚠️  Backend'e bağlanılamadı: {url}")

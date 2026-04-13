@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 from sqlmodel import SQLModel, Field, JSON, Column
 
@@ -13,7 +13,7 @@ class LogBase(SQLModel):
 
 class LogEntry(LogBase, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 class CorrelationModel(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -26,7 +26,7 @@ class CorrelationModel(SQLModel, table=True):
     root_cause: Optional[str] = None
     impact_summary: Optional[str] = None
     age_seconds: float
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 class AlertModel(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -37,4 +37,4 @@ class AlertModel(SQLModel, table=True):
     timestamp: str
     is_resolved: bool = Field(default=False)
     is_false_positive: bool = Field(default=False)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
