@@ -14,13 +14,13 @@ import joblib
 from pathlib import Path
 
 from openai import OpenAI
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 from loguru import logger
 
 # ──────────────────────────────────────────────
 # Ortam değişkenleri
 # ──────────────────────────────────────────────
-load_dotenv()
+load_dotenv(find_dotenv())
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 ANOMALY_THRESHOLD = float(os.getenv("ANOMALY_THRESHOLD", "0.5"))
@@ -179,24 +179,13 @@ class AIEngine:
             anomaly_score = self._fallback_score(level)
             is_anomaly = (anomaly_score >= ANOMALY_THRESHOLD)
 
-        # ── LLM Derinlemesine Analiz ──
-        llm_comment = None
+        # ── LLM Derinlemesine Analiz Talebi ──
         # LLM çağrı koşulu:
         #   1. ML anomali tespiti + skor eşiğin üstünde
         #   2. VEYA log seviyesi ERROR/CRITICAL (model ne derse desin)
         should_call_llm = (is_anomaly and anomaly_score >= ANOMALY_THRESHOLD) or level in ("ERROR", "CRITICAL")
 
         logger.debug(f"LLM karar: anomaly={is_anomaly}, score={anomaly_score:.4f}, level={level}, should_call={should_call_llm}")
-
-        if should_call_llm:
-            logger.info(f"🧠 LLM çağrılıyor — {source}/{model_type} | skor={anomaly_score:.2f}")
-            llm_comment = self._ask_llm(source, message, level, model_type, anomaly_score)
-            if llm_comment:
-                logger.info(f"✅ LLM analizi alındı ({len(llm_comment)} karakter)")
-            else:
-                logger.warning(f"LLM boş yanıt döndürdü — {source}/{model_type}")
-        else:
-            logger.debug(f"LLM atlandı: score={anomaly_score:.4f}, level={level}")
 
         # ERROR/CRITICAL için minimum anomali skoru garantisi
         if level in ("ERROR", "CRITICAL") and anomaly_score < 0.5:
@@ -207,46 +196,9 @@ class AIEngine:
             "model_used":    model_used,
             "ml_prediction": "anomaly" if is_anomaly else "normal",
             "anomaly_score": round(anomaly_score, 4),
-            "llm_analysis":  llm_comment,
+            "llm_analysis":  "⏳ Analiz sıraya alındı (Celery Queue)" if should_call_llm else None,
+            "_should_call_llm": should_call_llm
         }
-
-    # ─── LLM Sorgulama ──────────────────────
-    def _ask_llm(self, source: str, message: str, level: str,
-                 model_type: str, score: float) -> str | None:
-        """Anomalili logu LLM'e (OpenAI GPT-4o) gönderip kök neden analizi yaptırır."""
-        if not self.client:
-            return None
-
-        prompt = f"""Bir Kıdemli Site Reliability Engineer (SRE) ve Sistem Mimarı olarak aşağıdaki sistem logunda tespit edilen anomaliyi analiz et.
-
-[ BAĞLAM VE KANITLAR ]
-📌 Kaynak:  {source} ({model_type} modeli)
-📌 Seviye:  {level}
-📌 Skor:    {score:.2f}
-📌 Log:     {message}
-
-[ GÖREV VE KURALLAR ]
-Sadece elindeki log metninde yazan teknik kanıtlara dayanarak, hiçbir varsayımda (hallucination) bulunmadan aşağıdaki soruları SIFIR hata payı ile yanıtla. Eğer log mesajında kesin bir kanıt yoksa, "Log detayı yetersiz, en olası durum şudur:" şeklinde belirt.
-
-Aşağıdaki formatı harfiyen kullanarak KISA, NET ve PROFESYONEL Türkçe yanıt ver:
-1. **Kök Neden**: (Hatanın teknik ve gerçek sebebi)
-2. **Etki**:      (Sisteme, servise veya network'e anlık etkisi)
-3. **Çözüm**:     (Bu sorunu izole etmek ve gidermek için atılacak ilk 2 KESİN operasyonel adım)"""
-
-        try:
-            response = self.client.chat.completions.create(
-                model="gpt-4o",
-                messages=[
-                    {"role": "system", "content": "Sen kıdemli bir DevOps/SRE ve Cloud Mimarı uzmanısın. Yalnızca elindeki verilere (log, source, level) odaklanıp, teknik kanıta (evidence-based) dayalı, nokta atışı ve çok net Türkçe analizler yaparsın. Asla genel geçer, yuvarlak veya varsayımsal cümleler kurmazsın."},
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=300,
-                temperature=0.1  # Çok daha tutarlı ve stabil yanıtlar için düşük sıcaklık
-            )
-            return response.choices[0].message.content.strip()
-        except Exception as e:
-            logger.error(f"LLM sorgu hatası: {e}")
-            return None
 
     # ─── Fallback Skor Hesaplama ─────────────
     def _fallback_score(self, level: str) -> float:

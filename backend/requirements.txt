@@ -10,3 +10,6 @@ sqlmodel
 openai
 loguru
 psycopg2-binary
+
+celery
+redis

@@ -1,9 +1,10 @@
 # LogSense AI Root .gitignore
 
-# ── Backend ──
-backend/logs.db
+# ── Backend (Python) ──
 backend/venv/
-backend/__pycache__/
+**/__pycache__/
+backend/logs/          # Loguru tarafından oluşturulan loglar
+backend/logs.db        # SQLite veritabanı
 *.py[cod]
 *$py.class
 backend/ai_engine_draft.py

@@ -3,7 +3,8 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import {
   XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
-  Area, AreaChart, LineChart, Line, ReferenceLine
+  Area, AreaChart, LineChart, Line, ReferenceLine,
+  BarChart, Bar, PieChart, Pie, Cell, Legend
 } from "recharts";
 
 // ──────────────────────────────────────────────
@@ -87,6 +88,14 @@ function useWebSocket(url: string) {
              window.dispatchEvent(new CustomEvent('new-alert', { detail: p.data }));
           }
         }
+        else if (p.type === "llm_update") {
+          setLogs((prev) => prev.map(log => 
+            log.id === p.log_id 
+              ? { ...log, ai_analysis: { ...log.ai_analysis, llm_analysis: p.llm_analysis } as AIAnalysis }
+              : log
+          ));
+          window.dispatchEvent(new CustomEvent('update-alert', { detail: p }));
+        }
         else if (p.type === "correlation") {
           window.dispatchEvent(new CustomEvent('new-correlation', { detail: p.data }));
         }
@@ -127,13 +136,95 @@ function buildChart(logs: LogEntry[]): ChartPoint[] {
   return Object.values(b).slice(-20);
 }
 
+function buildSourceData(logs: LogEntry[]) {
+  const counts: Record<string, number> = {};
+  logs.forEach(l => { counts[l.source] = (counts[l.source] || 0) + 1; });
+  return Object.entries(counts).map(([name, value]) => ({ name, value })).sort((a,b) => b.value - a.value);
+}
+
+function buildSeverityData(logs: LogEntry[]) {
+  const s = { INFO: 0, WARN: 0, ERROR: 0, CRITICAL: 0 };
+  logs.forEach(l => { if(l.level in s) s[l.level as keyof typeof s]++; });
+  return [
+    { name: "Info", value: s.INFO, color: "#3b82f6" },
+    { name: "Warn", value: s.WARN, color: "#f59e0b" },
+    { name: "Error", value: s.ERROR, color: "#ef4444" },
+    { name: "Critical", value: s.CRITICAL, color: "#7f1d1d" },
+  ].filter(x => x.value > 0);
+}
+
+function buildHttpData(logs: LogEntry[]) {
+  const counts: Record<string, number> = { "2xx": 0, "4xx": 0, "5xx": 0 };
+  logs.forEach(l => {
+    const code = l.enrichment?.http_info?.code;
+    if (code) {
+      if (code >= 200 && code < 300) counts["2xx"]++;
+      else if (code >= 400 && code < 500) counts["4xx"]++;
+      else if (code >= 500) counts["5xx"]++;
+    }
+  });
+  return Object.entries(counts).map(([name, value]) => ({ name, value })).filter(x => x.value > 0);
+}
+
+function buildRiskData(logs: LogEntry[]) {
+  const counts: Record<string, number> = { "Low": 0, "Medium": 0, "High": 0 };
+  logs.forEach(l => {
+    const risk = l.enrichment?.ip_info?.risk_level;
+    if (risk) {
+      const key = risk.charAt(0).toUpperCase() + risk.slice(1);
+      if (key in counts) counts[key]++;
+    }
+  });
+  return Object.entries(counts).map(([name, value]) => ({ name, value })).filter(x => x.value > 0);
+}
+
+function buildTopErrorsData(logs: LogEntry[]) {
+  const counts: Record<string, number> = {};
+  logs.forEach(l => {
+    if (l.level === "ERROR" || l.level === "CRITICAL") {
+      // Mesajı normalize et: ID'ler ve zaman damgaları gibi değişken kısımları temizlemeye çalış
+      const cleanMsg = l.message.replace(/\d+/g, 'X').substring(0, 60) + "...";
+      counts[cleanMsg] = (counts[cleanMsg] || 0) + 1;
+    }
+  });
+  return Object.entries(counts)
+    .map(([name, value]) => ({ name, value }))
+    .sort((a, b) => b.value - a.value)
+    .slice(0, 5);
+}
+
+function buildAnomalyStatusData(alerts: AlertEntry[]) {
+  const total = alerts.length;
+  // Note: Since alerts in state are usually 'only_open', this might need adjustment if history is kept
+  return [
+    { name: "Aktif", value: alerts.filter(a => !a.is_resolved).length, color: "#ef4444" },
+    { name: "Çözüldü", value: alerts.filter(a => a.is_resolved).length, color: "#22c55e" },
+  ].filter(x => x.value > 0);
+}
+
 // ──────────────────────────────────────────────
 // Dashboard
 // ──────────────────────────────────────────────
 export default function Dashboard() {
   const { logs, connected, clearLogs } = useWebSocket(`${WS_URL}/ws/logs`);
   const [activeTab, setActiveTab] = useState<"overview" | "logs" | "ai" | "correlations">("overview");
+  const [theme, setTheme] = useState<"dark" | "light">("dark");
   const [sending, setSending] = useState(false);
+
+  // Theme support
+  useEffect(() => {
+    const savedTheme = localStorage.getItem("theme") as "dark" | "light" | null;
+    if (savedTheme) setTheme(savedTheme);
+  }, []);
+
+  useEffect(() => {
+    if (theme === "light") {
+      document.documentElement.classList.add("light-theme");
+    } else {
+      document.documentElement.classList.remove("light-theme");
+    }
+    localStorage.setItem("theme", theme);
+  }, [theme]);
 
   // Shared Filters
   const [levelFilter, setLevelFilter] = useState<string | null>(null);
@@ -171,6 +262,21 @@ export default function Dashboard() {
     fetchAlerts();
     fetchCorrelations();
   }, [fetchAlerts, fetchCorrelations]);
+
+  const clearAllHistory = useCallback(async () => {
+    try {
+      if (!confirm("Tüm log, anomali ve AI analiz geçmişini silmek istediğinize emin misiniz?")) return;
+      
+      const resp = await fetch(`${API_URL}/api/history/clear-all`, { method: "DELETE" });
+      if (resp.ok) {
+        clearLogs(); // Local logs state'i temizle
+        setAlerts([]); // Local alerts state'i temizle
+        setCorrelations([]); // Local correlations state'i temizle
+      }
+    } catch (e) {
+      console.error("Error clearing history:", e);
+    }
+  }, [clearLogs]);
 
   // Handle incoming live alerts/correlations
   useEffect(() => {
@@ -244,6 +350,12 @@ export default function Dashboard() {
   const paginatedAlerts = filteredAlerts.slice((alertPage - 1) * ALERTS_PER_PAGE, alertPage * ALERTS_PER_PAGE);
 
   const chartData = useMemo(() => buildChart(logs), [logs]);
+  const sourceData = useMemo(() => buildSourceData(logs), [logs]);
+  const severityData = useMemo(() => buildSeverityData(logs), [logs]);
+  const httpData = useMemo(() => buildHttpData(logs), [logs]);
+  const riskData = useMemo(() => buildRiskData(logs), [logs]);
+  const topErrorsData = useMemo(() => buildTopErrorsData(logs), [logs]);
+  const anomalyStatusData = useMemo(() => buildAnomalyStatusData(alerts), [alerts]);
 
   // ──── Persistent Alert Actions ────
   const resolveAlert = async (id: number) => {
@@ -307,10 +419,13 @@ export default function Dashboard() {
       </div>
       {showLevel && (
         <div className="filter-levels">
-          {["ALL", "INFO", "WARN", "ERROR", "CRITICAL"].map(lvl => (
-            <button key={lvl} className={`level-btn ${(lvl === "ALL" ? levelFilter === null : levelFilter === lvl) ? "active" : ""}`}
-              onClick={() => setLevelFilter(lvl === "ALL" ? null : (levelFilter === lvl ? null : lvl))}>{lvl}</button>
-          ))}
+          {["ALL", "INFO", "WARN", "ERROR", "CRITICAL"].map(lvl => {
+            const isActive = lvl === "ALL" ? levelFilter === null : levelFilter === lvl;
+            return (
+              <button key={lvl} className={`level-btn ${lvl} ${isActive ? "active" : ""}`}
+                onClick={() => setLevelFilter(lvl === "ALL" ? null : (levelFilter === lvl ? null : lvl))}>{lvl}</button>
+            );
+          })}
         </div>
       )}
       <select className="filter-select" value={sourceFilter} onChange={e => setSourceFilter(e.target.value)}>
@@ -364,6 +479,9 @@ export default function Dashboard() {
           <button className="error-trigger-btn" onClick={triggerError} disabled={sending}>
             {sending ? "⏳ Gönderiliyor..." : "💥 Test Hatası Üret"}
           </button>
+          <button className="theme-toggle-btn" onClick={() => setTheme(prev => prev === "dark" ? "light" : "dark")}>
+            {theme === "dark" ? "☀️ Aydınlık Mod" : "🌙 Karanlık Mod"}
+          </button>
         </div>
       </aside>
 
@@ -382,47 +500,109 @@ export default function Dashboard() {
             <div className="h-stat warn"><span className="h-stat-n">{stats.warn}</span> uyarı</div>
             <div className="h-stat error"><span className="h-stat-n">{stats.error}</span> hata</div>
             <div className="h-stat anomaly"><span className="h-stat-n">{stats.anomalies}</span> anomali</div>
+            <div className="header-sync-badge">
+              <span className="sync-dot"></span>
+              {new Date().toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+            </div>
           </div>
         </header>
 
         <main className="content-area">
 
-          {/* ═══════ TAB: OVERVIEW ═══════ */}
+          {/* ═══════ TAB: OVERVIEW (PRO COMMAND CENTER) ═══════ */}
           {activeTab === 'overview' && (
             <div className="tab-pane fade-in">
               <div className="stats-grid">
-                <div className="stat-box blue"><div className="stat-icon-wrap">📊</div><div className="stat-data"><span className="stat-num">{stats.total}</span><span className="stat-lbl">Total Logs</span></div></div>
-                <div className="stat-box cyan"><div className="stat-icon-wrap">ℹ️</div><div className="stat-data"><span className="stat-num">{stats.info}</span><span className="stat-lbl">Info</span></div></div>
-                <div className="stat-box yellow"><div className="stat-icon-wrap">⚠️</div><div className="stat-data"><span className="stat-num">{stats.warn}</span><span className="stat-lbl">Warnings</span></div></div>
-                <div className="stat-box red"><div className="stat-icon-wrap">🔴</div><div className="stat-data"><span className="stat-num">{stats.error}</span><span className="stat-lbl">Errors / Critical</span></div></div>
+                <div className="stat-box blue"><div className="stat-icon-wrap">📊</div><div className="stat-data"><span className="stat-num">{stats.total}</span><span className="stat-lbl">Toplam Log</span></div></div>
+                <div className="stat-box cyan"><div className="stat-icon-wrap">ℹ️</div><div className="stat-data"><span className="stat-num">{stats.info}</span><span className="stat-lbl">Bilgi Akışı</span></div></div>
+                <div className="stat-box yellow"><div className="stat-icon-wrap">⚠️</div><div className="stat-data"><span className="stat-num">{stats.warn}</span><span className="stat-lbl">Uyarılar</span></div></div>
+                <div className="stat-box red"><div className="stat-icon-wrap">🔴</div><div className="stat-data"><span className="stat-num">{stats.error}</span><span className="stat-lbl">Hatalar</span></div></div>
               </div>
+
+              {/* TIER 1: Traffic & Intelligence */}
               <div className="charts-row">
                 <div className="chart-card-v2">
-                  <div className="chart-title-v2">📈 Log Hacmi <span className="badge-live-sm">CANLI</span></div>
-                  <ResponsiveContainer width="100%" height={220}>
+                  <div className="chart-title-v2">📈 Gerçek Zamanlı Trafik Hacmi <span className="badge-live-sm">CANLI</span></div>
+                  <ResponsiveContainer width="100%" height={240}>
                     <AreaChart data={chartData}>
                       <defs>
-                        <linearGradient id="gI" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor="#3b82f6" stopOpacity={0.3} /><stop offset="95%" stopColor="#3b82f6" stopOpacity={0} /></linearGradient>
-                        <linearGradient id="gW" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor="#f59e0b" stopOpacity={0.3} /><stop offset="95%" stopColor="#f59e0b" stopOpacity={0} /></linearGradient>
-                        <linearGradient id="gE" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor="#ef4444" stopOpacity={0.3} /><stop offset="95%" stopColor="#ef4444" stopOpacity={0} /></linearGradient>
+                        <linearGradient id="gI" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor="#3b82f6" stopOpacity={0.4} /><stop offset="95%" stopColor="#3b82f6" stopOpacity={0} /></linearGradient>
                       </defs>
-                      <CartesianGrid stroke="#1e293b" strokeDasharray="3 3" /><XAxis dataKey="time" stroke="#475569" fontSize={10} /><YAxis stroke="#475569" fontSize={10} />
-                      <Tooltip contentStyle={{ background: "#1a1f2e", border: "1px solid #1e293b", borderRadius: 8, fontSize: 12, color: "#e2e8f0" }} />
-                      <Area type="monotone" dataKey="info" stroke="#3b82f6" fill="url(#gI)" strokeWidth={2} name="Info" />
-                      <Area type="monotone" dataKey="warn" stroke="#f59e0b" fill="url(#gW)" strokeWidth={2} name="Warn" />
-                      <Area type="monotone" dataKey="error" stroke="#ef4444" fill="url(#gE)" strokeWidth={2} name="Error" />
+                      <CartesianGrid stroke="#1e293b" strokeDasharray="3 3" vertical={false} /><XAxis dataKey="time" stroke="#475569" fontSize={10} /><YAxis stroke="#475569" fontSize={10} />
+                      <Tooltip contentStyle={{ background: "#050505", border: "1px solid #1e293b", borderRadius: 8, fontSize: 12, color: "#fff" }} />
+                      <Area type="monotone" dataKey="info" stroke="#3b82f6" fill="url(#gI)" strokeWidth={2} name="Bilgi" />
+                      <Area type="monotone" dataKey="warn" stroke="#f59e0b" fill="transparent" strokeWidth={2} name="Uyarı" />
+                      <Area type="monotone" dataKey="error" stroke="#ef4444" fill="transparent" strokeWidth={2} name="Hata" />
                     </AreaChart>
                   </ResponsiveContainer>
                 </div>
                 <div className="chart-card-v2">
-                  <div className="chart-title-v2">🧠 ML Anomali Skoru <span className="badge-trend-sm">TREND</span></div>
-                  <ResponsiveContainer width="100%" height={220}>
+                  <div className="chart-title-v2">🧠 AI Anomali Zekası <span className="badge-trend-sm">GPT-4o</span></div>
+                  <ResponsiveContainer width="100%" height={240}>
                     <LineChart data={chartData}>
-                      <CartesianGrid stroke="#1e293b" strokeDasharray="3 3" /><XAxis dataKey="time" stroke="#475569" fontSize={10} /><YAxis stroke="#475569" fontSize={10} domain={[0, 1]} ticks={[0, 0.25, 0.5, 0.75, 1]} />
-                      <Tooltip contentStyle={{ background: "#1a1f2e", border: "1px solid #c084fc", borderRadius: 8, fontSize: 12, color: "#e2e8f0" }} formatter={(v: any) => [(Number(v) * 100).toFixed(0) + "%", "Skor"]} />
-                      <ReferenceLine y={0.5} stroke="#ef4444" strokeDasharray="3 3" label={{ value: "Eşik", fill: "#ef4444", fontSize: 10 }} />
-                      <Line type="monotone" dataKey="maxScore" stroke="#c084fc" strokeWidth={3} dot={false} activeDot={{ r: 4 }} />
+                      <CartesianGrid stroke="#1e293b" strokeDasharray="3 3" vertical={false} /><XAxis dataKey="time" stroke="#475569" fontSize={10} /><YAxis stroke="#475569" fontSize={10} domain={[0, 1]} />
+                      <Tooltip contentStyle={{ background: "#050505", border: "1px solid #c084fc", borderRadius: 8, fontSize: 12, color: "#fff" }} formatter={(v: any) => [(Number(v) * 100).toFixed(0) + "%", "Olasılık"]} />
+                      <ReferenceLine y={0.5} stroke="#ef4444" strokeDasharray="5 5" label={{ value: "Alarm Eşiği", fill: "#ef4444", fontSize: 10, position: 'right' }} />
+                      <Line type="monotone" dataKey="maxScore" stroke="#c084fc" strokeWidth={3} dot={false} activeDot={{ r: 5 }} />
                     </LineChart>
+                  </ResponsiveContainer>
+                </div>
+              </div>
+
+              {/* TIER 2: Specialized Diagnostics */}
+              <div className="charts-row triple">
+                <div className="chart-card-v2">
+                  <div className="chart-title-v2">❤️ Sistem Sağlık Oranı</div>
+                  <ResponsiveContainer width="100%" height={200}>
+                    <PieChart>
+                      <Pie data={severityData} innerRadius={55} outerRadius={75} paddingAngle={5} dataKey="value" stroke="none">
+                        {severityData.map((entry, index) => <Cell key={`c-${index}`} fill={entry.color} />)}
+                      </Pie>
+                      <Tooltip contentStyle={{ background: "#050505", border: "1px solid #1e293b", borderRadius: 8, fontSize: 11 }} />
+                      <Legend verticalAlign="bottom" height={36} iconType="circle" wrapperStyle={{ fontSize: 10 }} />
+                    </PieChart>
+                  </ResponsiveContainer>
+                </div>
+                <div className="chart-card-v2">
+                  <div className="chart-title-v2">🌐 HTTP Durum Kodları</div>
+                  <ResponsiveContainer width="100%" height={200}>
+                    <BarChart data={httpData}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} />
+                      <XAxis dataKey="name" stroke="#475569" fontSize={10} />
+                      <YAxis stroke="#475569" fontSize={10} />
+                      <Tooltip contentStyle={{ background: "#050505", border: "1px solid #1e293b", borderRadius: 8, fontSize: 11 }} />
+                      <Bar dataKey="value" fill="#22d3ee" barSize={24} radius={[4, 4, 0, 0]} />
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+                <div className="chart-card-v2">
+                  <div className="chart-title-v2">🛡️ IP Güvenlik Risk Profilleme</div>
+                  <ResponsiveContainer width="100%" height={200}>
+                    <PieChart>
+                      <Pie data={riskData} dataKey="value" nameKey="name" outerRadius={70} stroke="none">
+                        {riskData.map((entry, index) => (
+                          <Cell key={`r-${index}`} fill={entry.name==='High'?'#ef4444':entry.name==='Medium'?'#f59e0b':'#22c55e'} />
+                        ))}
+                      </Pie>
+                      <Tooltip contentStyle={{ background: "#050505", border: "1px solid #1e293b", borderRadius: 8, fontSize: 11 }} />
+                      <Legend verticalAlign="bottom" height={36} iconType="circle" wrapperStyle={{ fontSize: 10 }} />
+                    </PieChart>
+                  </ResponsiveContainer>
+                </div>
+              </div>
+
+              {/* TIER 3: Operational Incident Patterns */}
+              <div className="charts-row single">
+                <div className="chart-card-v2">
+                  <div className="chart-title-v2">🚨 En Sık Karşılaşılan Hata Desenleri (Kök Neden Analizi)</div>
+                  <ResponsiveContainer width="100%" height={220}>
+                    <BarChart data={topErrorsData} layout="vertical" margin={{ left: 30, right: 30 }}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" horizontal={true} vertical={false} />
+                      <XAxis type="number" hide />
+                      <YAxis dataKey="name" type="category" stroke="#94a3b8" fontSize={9} width={180} />
+                      <Tooltip cursor={{ fill: 'transparent' }} contentStyle={{ background: "#050505", border: "1px solid #ef4444", borderRadius: 8, fontSize: 11 }} />
+                      <Bar dataKey="value" fill="#ef4444" barSize={14} radius={[0, 4, 4, 0]} />
+                    </BarChart>
                   </ResponsiveContainer>
                 </div>
               </div>
@@ -439,7 +619,7 @@ export default function Dashboard() {
                   <span className="terminal-uri">logsense://canli-akis — {filteredLogs.length} kayıt</span>
                   <div className="terminal-controls">
                     <span className="badge-live">● CANLI</span>
-                    <button className="term-btn" onClick={() => { if (confirm("Tüm logları temizle?")) clearLogs(); }}>🗑️</button>
+                    <button className="term-btn" onClick={clearAllHistory} title="Tüm geçmişi sil">🗑️ Temizle</button>
                   </div>
                 </div>
                 <div className="terminal-body-v2">
@@ -606,6 +786,27 @@ export default function Dashboard() {
                 <div className="alert-popup-time">{fmtTime(selectedAlert.timestamp)}</div>
               </div>
               <div className="alert-popup-message">{selectedAlert.message}</div>
+              
+              {selectedAlert.ai_analysis && (
+                <>
+                  <div className="modal-divider"></div>
+                  <div className="modal-field">
+                    <span className="modal-label">Anomali Skoru</span>
+                    <span className="modal-value" style={{ color: 'var(--accent-red)', fontWeight: 'bold' }}>
+                      {(selectedAlert.ai_analysis.anomaly_score * 100).toFixed(1)}%
+                    </span>
+                  </div>
+                  {selectedAlert.ai_analysis.llm_analysis && (
+                    <div className="modal-llm" style={{ marginTop: 12 }}>
+                      <div className="llm-comment-header">🧠 AI Kök Neden & Çözüm Analizi</div>
+                      <div style={{ whiteSpace: 'pre-wrap', fontSize: '0.85rem', lineHeight: '1.6', color: 'var(--text-secondary)' }}>
+                        {selectedAlert.ai_analysis.llm_analysis}
+                      </div>
+                    </div>
+                  )}
+                </>
+              )}
+
               <div className="modal-divider"></div>
               <div className="alert-popup-actions">
                 <button className="alert-popup-action-btn resolve" onClick={() => resolveAlert(selectedAlert.id)}>✅ Çözüldü İşaretle</button>

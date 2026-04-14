@@ -16,9 +16,9 @@ import json
 from datetime import datetime, timezone
 
 import httpx
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 
-load_dotenv()
+load_dotenv(find_dotenv())
 
 API_KEY = os.getenv("LOGSENSE_API_KEY", "")
 
@@ -227,7 +227,7 @@ def send_log(url: str, log_data: dict) -> bool:
         if response.status_code == 403:
             print(f"⚠️  API Key reddedildi (403). LOGSENSE_API_KEY değişkenini kontrol et.")
             return False
-        return response.status_code == 200
+        return response.status_code in (200, 202)
     except httpx.ConnectError:
         print(f"⚠️  Backend'e bağlanılamadı: {url}")
         return False
