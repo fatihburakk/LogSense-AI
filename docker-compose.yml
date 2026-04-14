@@ -40,6 +40,8 @@ services:
       BUFFER_SIZE: ${BUFFER_SIZE:-100}
     ports:
       - "8000:8000"
+    volumes:
+      - backups_data:/app/backups
 
   celery_worker:
     build: 
@@ -55,6 +57,22 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY}
       ANOMALY_THRESHOLD: ${ANOMALY_THRESHOLD:-0.5}
     command: celery -A worker.celery_app worker --loglevel=info
+    volumes:
+      - backups_data:/app/backups
+
+  celery_beat:
+    build: 
+      context: ./backend
+    container_name: logsense-beat
+    restart: always
+    depends_on:
+      - db
+      - redis
+    environment:
+      DATABASE_URL: postgresql://logsense:logsense_pass_2024@db:5432/logsense_ai
+      REDIS_URL: redis://redis:6379/0
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+    command: celery -A worker.celery_app beat --loglevel=info
 
   frontend:
     build:
@@ -71,3 +89,4 @@ services:
 
 volumes:
   postgres_data:
+  backups_data:

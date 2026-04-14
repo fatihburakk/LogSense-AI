@@ -1,5 +1,5 @@
 import os
-from sqlmodel import SQLModel, create_engine, Session
+from sqlmodel import SQLModel, create_engine, Session, select
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -21,8 +21,17 @@ connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite")
 engine = create_engine(DATABASE_URL, connect_args=connect_args)
 
 def init_db():
-    """Tabloları oluşturur."""
+    """Tabloları oluşturur ve varsayılan ayarları ilklendirir."""
     SQLModel.metadata.create_all(engine)
+    
+    # Varsayılan ayarları kontrol et ve ekle
+    from models import SystemSettings
+    with Session(engine) as session:
+        settings = session.exec(select(SystemSettings)).first()
+        if not settings:
+            default_settings = SystemSettings(retention_days=15, auto_backup=True)
+            session.add(default_settings)
+            session.commit()
 
 def get_session():
     """Veritabanı oturumu sağlar."""

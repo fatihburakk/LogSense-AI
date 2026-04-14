@@ -1,13 +1,18 @@
 import os
 import json
 import hashlib
+import gzip
+import csv
+import shutil
+from datetime import datetime, timezone, timedelta
 from celery import Celery
+from celery.schedules import crontab
 from openai import OpenAI
 from loguru import logger
 import redis
-from sqlmodel import Session, select
+from sqlmodel import Session, select, delete
 from database import engine
-from models import AlertModel, LogEntry
+from models import AlertModel, LogEntry, CorrelationModel, SystemSettings
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -26,6 +31,14 @@ except Exception as e:
     logger.error(f"Redis bağlantı hatası: {e}")
     redis_client = None
 
+# ──── CELERY BEAT SCHEDULE ────
+celery_app.conf.beat_schedule = {
+    'daily-maintenance-task': {
+        'task': 'run_maintenance',
+        'schedule': crontab(hour=0, minute=0),  # Her gece yarısı
+    },
+}
+celery_app.conf.timezone = 'UTC'
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 CACHE_TTL = 3600 * 2  # 2 hours
@@ -117,4 +130,78 @@ Aşağıdaki formatı kullanarak KISA, NET ve PROFESYONEL Türkçe yanıt ver:
 
         session.commit()
     
+
     return True
+
+# ──── MAINTENANCE TASKS (BACKUP & PRUNE) ────
+
+@celery_app.task(name="run_maintenance")
+def run_maintenance():
+    """Yedekleme ve Temizleme işlemlerini sırayla yürütür."""
+    logger.info("🛠️ Günlük bakım görevi başlatıldı.")
+    
+    with Session(engine) as session:
+        settings = session.exec(select(SystemSettings)).first()
+        if not settings:
+            logger.warning("Sistem ayarları bulunamadı, varsayılanlar kullanılıyor.")
+            retention_days = 15
+            auto_backup = True
+        else:
+            retention_days = settings.retention_days
+            auto_backup = settings.auto_backup
+
+    # 1. Backup if enabled
+    if auto_backup:
+        backup_path = backup_to_gz()
+        if not backup_path:
+            logger.error("❌ Yedekleme başarısız, temizlik işlemi güvenlik nedeniyle iptal edildi.")
+            return False
+
+    # 2. Prune old data
+    prune_old_data(retention_days)
+    
+    logger.info("✅ Günlük bakım başarıyla tamamlandı.")
+    return True
+
+def backup_to_gz():
+    """Tüm log veritabanını GZIP sıkıştırmalı CSV olarak yedekler."""
+    backup_dir = "/app/backups"
+    if not os.path.exists(backup_dir):
+        os.makedirs(backup_dir, exist_ok=True)
+    
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    filename = f"logsense_backup_{timestamp}.csv.gz"
+    filepath = os.path.join(backup_dir, filename)
+    
+    try:
+        with Session(engine) as session:
+            logs = session.exec(select(LogEntry)).all()
+            
+        with gzip.open(filepath, 'wt', encoding='utf-8', newline='') as f:
+            writer = csv.writer(f, delimiter=';')
+            writer.writerow(['ID', 'Timestamp', 'Level', 'Source', 'Message'])
+            for log in logs:
+                writer.writerow([log.id, log.timestamp, log.level, log.source, log.message])
+        
+        file_size = os.path.getsize(filepath) / (1024 * 1024)
+        logger.info(f"📦 Yedekleme tamamlandı: {filename} ({file_size:.2f} MB)")
+        return filepath
+    except Exception as e:
+        logger.error(f"⚠️ Yedekleme sırasında hata: {e}")
+        return None
+
+def prune_old_data(days: int):
+    """Belirlenen günden eski verileri temizler."""
+    threshold_date = datetime.now(timezone.utc) - timedelta(days=days)
+    logger.info(f"🧹 {days} günden eski veriler temizleniyor... (Eşik: {threshold_date})")
+    
+    try:
+        with Session(engine) as session:
+            # Delete old logs, alerts, correlations
+            session.exec(delete(LogEntry).where(LogEntry.created_at < threshold_date))
+            session.exec(delete(AlertModel).where(AlertModel.created_at < threshold_date))
+            session.exec(delete(CorrelationModel).where(CorrelationModel.created_at < threshold_date))
+            session.commit()
+            logger.info("✨ Veritabanı başarıyla temizlendi.")
+    except Exception as e:
+        logger.error(f"⚠️ Temizlik sırasında hata: {e}")

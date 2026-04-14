@@ -38,3 +38,9 @@ class AlertModel(SQLModel, table=True):
     is_resolved: bool = Field(default=False)
     is_false_positive: bool = Field(default=False)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class SystemSettings(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    retention_days: int = Field(default=15)
+    auto_backup: bool = Field(default=True)
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

@@ -85,12 +85,12 @@ function useWebSocket(url: string) {
           setLogs((prev) => [p.data, ...prev.slice(0, 999)]);
           // If it's an anomaly, notify Dashboard to refresh alerts
           if (p.data.ai_analysis?.ml_prediction === "anomaly") {
-             window.dispatchEvent(new CustomEvent('new-alert', { detail: p.data }));
+            window.dispatchEvent(new CustomEvent('new-alert', { detail: p.data }));
           }
         }
         else if (p.type === "llm_update") {
-          setLogs((prev) => prev.map(log => 
-            log.id === p.log_id 
+          setLogs((prev) => prev.map(log =>
+            log.id === p.log_id
               ? { ...log, ai_analysis: { ...log.ai_analysis, llm_analysis: p.llm_analysis } as AIAnalysis }
               : log
           ));
@@ -139,12 +139,12 @@ function buildChart(logs: LogEntry[]): ChartPoint[] {
 function buildSourceData(logs: LogEntry[]) {
   const counts: Record<string, number> = {};
   logs.forEach(l => { counts[l.source] = (counts[l.source] || 0) + 1; });
-  return Object.entries(counts).map(([name, value]) => ({ name, value })).sort((a,b) => b.value - a.value);
+  return Object.entries(counts).map(([name, value]) => ({ name, value })).sort((a, b) => b.value - a.value);
 }
 
 function buildSeverityData(logs: LogEntry[]) {
   const s = { INFO: 0, WARN: 0, ERROR: 0, CRITICAL: 0 };
-  logs.forEach(l => { if(l.level in s) s[l.level as keyof typeof s]++; });
+  logs.forEach(l => { if (l.level in s) s[l.level as keyof typeof s]++; });
   return [
     { name: "Info", value: s.INFO, color: "#3b82f6" },
     { name: "Warn", value: s.WARN, color: "#f59e0b" },
@@ -245,6 +245,75 @@ export default function Dashboard() {
   const [alerts, setAlerts] = useState<AlertEntry[]>([]);
   const [alertView, setAlertView] = useState<'active' | 'resolved' | 'false_positive'>('active');
 
+  // System Management State
+  const [showSystemModal, setShowSystemModal] = useState(false);
+  const [systemTab, setSystemTab] = useState<'settings' | 'backups' | 'maintenance'>('settings');
+  const [systemSettings, setSystemSettings] = useState({ retention_days: 15, auto_backup: true });
+  const [backups, setBackups] = useState<any[]>([]);
+  const [isMaintenanceRunning, setIsMaintenanceRunning] = useState(false);
+  const [systemToast, setSystemToast] = useState<{ type: 'success' | 'error', msg: string } | null>(null);
+
+  const fetchSystemSettings = useCallback(async () => {
+    try {
+      const resp = await fetch(`${API_URL}/api/system/settings`);
+      const data = await resp.json();
+      if (data) setSystemSettings(data);
+    } catch (e) {
+      console.error("Error fetching system settings:", e);
+    }
+  }, []);
+
+  const updateSystemSettings = async (updates: any) => {
+    try {
+      const resp = await fetch(`${API_URL}/api/system/settings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updates)
+      });
+      const data = await resp.json();
+      if (data) setSystemSettings(data);
+    } catch (e) {
+      console.error("Error updating system settings:", e);
+    }
+  };
+
+  const fetchBackups = useCallback(async () => {
+    try {
+      const resp = await fetch(`${API_URL}/api/system/backups`);
+      const data = await resp.json();
+      if (Array.isArray(data)) setBackups(data);
+    } catch (e) {
+      console.error("Error fetching backups:", e);
+    }
+  }, []);
+
+  const downloadBackup = (filename: string) => {
+    window.open(`${API_URL}/api/system/backups/${filename}/download`, '_blank');
+  };
+
+  const deleteBackup = async (filename: string) => {
+    if (!confirm(`${filename} dosyasını kalıcı olarak silmek istediğinize emin misiniz?`)) return;
+    try {
+      await fetch(`${API_URL}/api/system/backups/${filename}`, { method: 'DELETE' });
+      fetchBackups();
+    } catch (e) {
+      console.error("Error deleting backup:", e);
+    }
+  };
+
+  const triggerMaintenance = async () => {
+    setIsMaintenanceRunning(true);
+    try {
+      await fetch(`${API_URL}/api/system/maintenance`, { method: 'POST' });
+      alert("Bakım görevi başlatıldı! İşlem arka planda yürütülüyor.");
+      setTimeout(fetchBackups, 3000);
+    } catch (e) {
+      console.error("Error triggering maintenance:", e);
+    } finally {
+      setIsMaintenanceRunning(false);
+    }
+  };
+
   const fetchAlerts = useCallback(async (view: 'active' | 'resolved' | 'false_positive' = 'active') => {
     try {
       let url = `${API_URL}/api/alerts`;
@@ -277,12 +346,14 @@ export default function Dashboard() {
   useEffect(() => {
     fetchAlerts();
     fetchCorrelations();
-  }, [fetchAlerts, fetchCorrelations]);
+    fetchSystemSettings();
+    fetchBackups();
+  }, [fetchAlerts, fetchCorrelations, fetchSystemSettings, fetchBackups]);
 
   const clearAllHistory = useCallback(async () => {
     try {
       if (!confirm("Tüm log, anomali ve AI analiz geçmişini silmek istediğinize emin misiniz?")) return;
-      
+
       const resp = await fetch(`${API_URL}/api/history/clear-all`, { method: "DELETE" });
       if (resp.ok) {
         clearLogs(); // Local logs state'i temizle
@@ -398,14 +469,14 @@ export default function Dashboard() {
       dataToExport = dataToExport.filter(l => new Date(l.timestamp) <= endObj);
     }
 
-    const csvContent = "data:text/csv;charset=utf-8," 
+    const csvContent = "data:text/csv;charset=utf-8,"
       + "Zaman;Seviye;Kaynak;Mesaj\n"
       + dataToExport.map(l => `${l.timestamp};${l.level};${l.source};"${l.message.replace(/"/g, '""')}"`).join("\n");
-    
+
     const encodedUri = encodeURI(csvContent);
     const link = document.createElement("a");
     link.setAttribute("href", encodedUri);
-    link.setAttribute("download", `logsense_export_${new Date().toISOString().slice(0,10)}.csv`);
+    link.setAttribute("download", `logsense_export_${new Date().toISOString().slice(0, 10)}.csv`);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -416,11 +487,11 @@ export default function Dashboard() {
     const end = new Date();
     const start = new Date();
     start.setDate(end.getDate() - days);
-    
+
     const formatForInput = (d: Date) => {
       return new Date(d.getTime() - (d.getTimezoneOffset() * 60000)).toISOString().slice(0, 16);
     };
-    
+
     setExportEndStr(formatForInput(end));
     setExportStartStr(formatForInput(start));
   };
@@ -431,7 +502,7 @@ export default function Dashboard() {
   };
 
   const shareCorrelation = (corr: CorrelationGroup) => {
-    const text = `🔗 *LogSense Korelasyon Raporu* 🔗\n*Zincir ID:* ${corr.group_id}\n*Etiket:* ${corr.chain_label}\n\n*Etki Özeti:*\n${corr.impact_summary || "Bilinmiyor."}\n\n*Bağlı Olaylar (${corr.event_count}):*\n${corr.events.map((e, i) => `${i+1}. [${e.source}] ${e.message} (${fmtTime(e.timestamp)})`).join('\n')}`;
+    const text = `🔗 *LogSense Korelasyon Raporu* 🔗\n*Zincir ID:* ${corr.group_id}\n*Etiket:* ${corr.chain_label}\n\n*Etki Özeti:*\n${corr.impact_summary || "Bilinmiyor."}\n\n*Bağlı Olaylar (${corr.event_count}):*\n${corr.events.map((e, i) => `${i + 1}. [${e.source}] ${e.message} (${fmtTime(e.timestamp)})`).join('\n')}`;
     copyToClipboard(text);
   };
 
@@ -555,6 +626,10 @@ export default function Dashboard() {
             <span className="nav-icon">🔗</span> Korelasyonlar
             {correlations.length > 0 && <span className="nav-badge" style={{ background: 'var(--accent-cyan)' }}>{correlations.length}</span>}
           </button>
+          <div className="sidebar-divider"></div>
+          <button className="nav-item system-btn" onClick={() => setShowSystemModal(true)}>
+            <span className="nav-icon">⚙️</span> Sistem Ayarları
+          </button>
         </nav>
 
         <div className="sidebar-footer">
@@ -615,8 +690,8 @@ export default function Dashboard() {
                         <linearGradient id="gI" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor="#3b82f6" stopOpacity={0.4} /><stop offset="95%" stopColor="#3b82f6" stopOpacity={0} /></linearGradient>
                       </defs>
                       <CartesianGrid stroke="#1e293b" strokeDasharray="3 3" vertical={false} /><XAxis dataKey="time" stroke="#475569" fontSize={10} /><YAxis stroke="#475569" fontSize={10} />
-                      <Tooltip 
-                        contentStyle={{ background: "var(--bg-card)", border: "1px solid var(--border-hover)", borderRadius: 8, fontSize: 12 }} 
+                      <Tooltip
+                        contentStyle={{ background: "var(--bg-card)", border: "1px solid var(--border-hover)", borderRadius: 8, fontSize: 12 }}
                         itemStyle={{ color: "var(--text-primary)" }}
                         labelStyle={{ color: "var(--text-secondary)" }}
                       />
@@ -671,7 +746,7 @@ export default function Dashboard() {
                     <PieChart>
                       <Pie data={riskData} dataKey="value" nameKey="name" outerRadius={70} stroke="none">
                         {riskData.map((entry, index) => (
-                          <Cell key={`r-${index}`} fill={entry.name==='High'?'#ef4444':entry.name==='Medium'?'#f59e0b':'#22c55e'} />
+                          <Cell key={`r-${index}`} fill={entry.name === 'High' ? '#ef4444' : entry.name === 'Medium' ? '#f59e0b' : '#22c55e'} />
                         ))}
                       </Pie>
                       <Tooltip contentStyle={{ background: "var(--bg-card)", border: "1px solid var(--border-hover)", borderRadius: 8, fontSize: 11 }} itemStyle={{ color: "var(--text-primary)" }} />
@@ -690,9 +765,9 @@ export default function Dashboard() {
                       <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" horizontal={true} vertical={false} />
                       <XAxis type="number" hide />
                       <YAxis dataKey="name" type="category" stroke="#94a3b8" fontSize={9} width={180} />
-                      <Tooltip 
-                        cursor={{ fill: 'rgba(255,255,255,0.03)' }} 
-                        contentStyle={{ background: "var(--bg-card)", border: "1px solid #ef4444", borderRadius: 8, fontSize: 11 }} 
+                      <Tooltip
+                        cursor={{ fill: 'rgba(255,255,255,0.03)' }}
+                        contentStyle={{ background: "var(--bg-card)", border: "1px solid #ef4444", borderRadius: 8, fontSize: 11 }}
                         itemStyle={{ color: "var(--text-primary)" }}
                         labelStyle={{ color: "var(--text-secondary)", fontSize: 9 }}
                       />
@@ -758,21 +833,21 @@ export default function Dashboard() {
               {/* Archive Toggle Header */}
               <div className="ai-archive-header">
                 <div className="ai-view-toggle">
-                  <button 
-                    className={`ai-view-btn ${alertView === 'active' ? 'active' : ''}`} 
+                  <button
+                    className={`ai-view-btn ${alertView === 'active' ? 'active' : ''}`}
                     onClick={() => setAlertView('active')}
                   >
                     🔴 Aktif Anomaliler
                     {alertView === 'active' && alerts.length > 0 && <span className="ai-view-count">{alerts.length}</span>}
                   </button>
-                  <button 
-                    className={`ai-view-btn ${alertView === 'resolved' ? 'active resolved' : ''}`} 
+                  <button
+                    className={`ai-view-btn ${alertView === 'resolved' ? 'active resolved' : ''}`}
                     onClick={() => setAlertView('resolved')}
                   >
                     ✅ Çözülenler Arşivi
                   </button>
-                  <button 
-                    className={`ai-view-btn ${alertView === 'false_positive' ? 'active false-pos' : ''}`} 
+                  <button
+                    className={`ai-view-btn ${alertView === 'false_positive' ? 'active false-pos' : ''}`}
                     onClick={() => setAlertView('false_positive')}
                   >
                     🚫 Hatalı Alarmlar
@@ -792,11 +867,11 @@ export default function Dashboard() {
                       {alertView === 'active' ? 'Sistem Temiz' : alertView === 'resolved' ? 'Çözülen Alarm Yok' : 'Hatalı Alarm Kaydı Yok'}
                     </h3>
                     <p>
-                      {alertView === 'active' 
-                        ? 'Anomali tespit edilmedi. AI motoru altyapınızı sürekli tarıyor.' 
-                        : alertView === 'resolved' 
-                        ? 'Henüz çözülen bir anomali kaydı bulunmuyor.'
-                        : 'Hatalı alarm olarak işaretlenmiş kayıt yok.'}
+                      {alertView === 'active'
+                        ? 'Anomali tespit edilmedi. AI motoru altyapınızı sürekli tarıyor.'
+                        : alertView === 'resolved'
+                          ? 'Henüz çözülen bir anomali kaydı bulunmuyor.'
+                          : 'Hatalı alarm olarak işaretlenmiş kayıt yok.'}
                     </p>
                   </div>
                 ) : paginatedAlerts.map((alert) => (
@@ -804,7 +879,7 @@ export default function Dashboard() {
                     {/* Status ribbon */}
                     {alert.is_resolved && <div className="ai-card-ribbon resolved">✅ Çözüldü</div>}
                     {alert.is_false_positive && <div className="ai-card-ribbon false-pos">🚫 Hatalı</div>}
-                    
+
                     <div className="ai-card-compact-top">
                       <span className={`ai-level-tag ${alert.level}`}>{alert.level === "CRITICAL" ? "💀" : alert.level === "ERROR" ? "🔴" : "⚠️"} {alert.level}</span>
                       <span className="ai-card-source-badge">{alert.source}</span>
@@ -815,15 +890,15 @@ export default function Dashboard() {
                       )}
                       <span className="ai-card-time-sm">{fmtTime(alert.timestamp)}</span>
                     </div>
-                    
+
                     <div className="ai-card-compact-msg">{alert.message}</div>
-                    
+
                     {alert.ai_analysis?.llm_analysis && (
                       <div className="ai-card-llm-preview">
                         🧠 {alert.ai_analysis.llm_analysis.substring(0, 120)}{alert.ai_analysis.llm_analysis.length > 120 ? '...' : ''}
                       </div>
                     )}
-                    
+
                     {alert.ai_analysis?.anomaly_score !== undefined && (
                       <div className="ai-card-score-bar">
                         <div className="score-bar-fill" style={{ width: `${alert.ai_analysis.anomaly_score * 100}%`, background: alert.ai_analysis.anomaly_score > 0.7 ? '#ef4444' : alert.ai_analysis.anomaly_score > 0.4 ? '#f59e0b' : '#22c55e' }} />
@@ -840,7 +915,7 @@ export default function Dashboard() {
                   </div>
                 ))}
               </div>
-              
+
               {totalAlertPages > 1 && (
                 <div className="pagination-bar" style={{ marginTop: 16 }}>
                   <button className="page-btn" onClick={() => setAlertPage(p => Math.max(1, p - 1))}>◀</button>
@@ -870,7 +945,7 @@ export default function Dashboard() {
                       <input type="text" className="filter-input" placeholder="Zincirlerde ara..." value={correlationSearchQuery} onChange={e => setCorrelationSearchQuery(e.target.value)} />
                     </div>
                   </div>
-                  
+
                   <div className="corr-trace-list">
                     {paginatedCorrelations.map(corr => (
                       <div key={corr.group_id} className="corr-trace-item" onClick={() => setSelectedCorrelation(corr)}>
@@ -1006,7 +1081,7 @@ export default function Dashboard() {
                 <div className="alert-popup-time">{fmtTime(selectedAlert.timestamp)}</div>
               </div>
               <div className="alert-popup-message">{selectedAlert.message}</div>
-              
+
               {selectedAlert.ai_analysis && (
                 <>
                   <div className="modal-divider"></div>
@@ -1066,7 +1141,7 @@ export default function Dashboard() {
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8, maxHeight: 300, overflowY: 'auto' }}>
                 {selectedCorrelation.events.map((evt, i) => (
                   <div key={i} style={{ display: 'flex', gap: 12, padding: '10px 12px', background: 'var(--bg-card-hover)', borderRadius: 6, border: '1px solid var(--border-primary)' }}>
-                     <div style={{ flex: 1 }}>
+                    <div style={{ flex: 1 }}>
                       <div style={{ display: 'flex', gap: 8, marginBottom: 4, alignItems: 'center' }}>
                         <span style={{ fontSize: '0.7rem', color: 'var(--text-dim)' }}>{fmtTime(evt.timestamp)}</span>
                         <span className={`log-level-badge ${evt.level}`} style={{ fontSize: '0.6rem' }}>{evt.level}</span>
@@ -1082,6 +1157,118 @@ export default function Dashboard() {
         </div>
       )}
 
+      {/* ═══════ MODAL: System Management ═══════ */}
+      {showSystemModal && (
+        <div className="sys-modal-overlay" onClick={() => setShowSystemModal(false)}>
+          <div className="sys-panel" onClick={e => e.stopPropagation()}>
+            <div className="sys-panel-header">
+              <div className="sys-panel-title-group">
+                <div className="sys-panel-icon">⚙️</div>
+                <div>
+                  <div className="sys-panel-title">Sistem Yönetimi & Bakım</div>
+                  <div className="sys-panel-subtitle">LogSense AI çekirdek yapılandırması</div>
+                </div>
+              </div>
+              <button className="sys-close-btn" onClick={() => setShowSystemModal(false)}>✕</button>
+            </div>
+
+            <div className="sys-tab-bar">
+              <button className={`sys-tab ${systemTab === 'settings' ? 'active' : ''}`} onClick={() => setSystemTab('settings')}>Genel Ayarlar</button>
+              <button className={`sys-tab ${systemTab === 'backups' ? 'active' : ''}`} onClick={() => setSystemTab('backups')}>Yedeklemeler</button>
+              <button className={`sys-tab ${systemTab === 'maintenance' ? 'active' : ''}`} onClick={() => setSystemTab('maintenance')}>Sistem Bakımı</button>
+            </div>
+
+            <div className="sys-body">
+              {systemTab === 'settings' && (
+                <div className="fade-in">
+                  <div className="sys-config-card">
+                    <div className="sys-config-header">
+                      <div>
+                        <div className="sys-config-title">Log Saklama Süresi</div>
+                        <div className="sys-config-desc">Veritabanında tutulacak maksimum log yaşı.</div>
+                      </div>
+                      <div className="sys-retention-badge">{systemSettings.retention_days} Gün</div>
+                    </div>
+                    <div className="sys-slider-container">
+                      <input type="range" min="1" max="90" className="sys-slider" value={systemSettings.retention_days}
+                        onChange={e => setSystemSettings(s => ({ ...s, retention_days: Number(e.target.value) }))}
+                        style={{ '--v': systemSettings.retention_days } as any} />
+                      <div className="sys-slider-labels"><span>1G</span><span>30G</span><span>60G</span><span>90G</span></div>
+                    </div>
+                  </div>
+
+                  <div className="sys-config-card" style={{ marginTop: 16 }}>
+                    <div className="sys-config-header">
+                      <div>
+                        <div className="sys-config-title">Otomatik Yedekleme</div>
+                        <div className="sys-config-desc">Her gece saat 00:00'da sistem yedeği alınır.</div>
+                      </div>
+                      <label className="sys-toggle">
+                        <input type="checkbox" checked={systemSettings.auto_backup}
+                          onChange={e => setSystemSettings(s => ({ ...s, auto_backup: e.target.checked }))} />
+                        <span className="sys-toggle-track"><span className="sys-toggle-thumb"></span></span>
+                      </label>
+                    </div>
+                  </div>
+                  <button className="sys-save-btn" style={{ marginTop: 24 }} onClick={() => updateSystemSettings(systemSettings)}>Değişiklikleri Kaydet</button>
+                </div>
+              )}
+
+              {systemTab === 'backups' && (
+                <div className="fade-in">
+                  <div className="sys-backups-header">
+                    <div className="sys-backups-title">Mevcut Yedekler (CSV.GZ)</div>
+                    <button className="sys-refresh-btn" onClick={fetchBackups}>🔄 Yenile</button>
+                  </div>
+                  <div className="sys-backup-grid">
+                    {backups.length === 0 ? (
+                      <div className="sys-backup-empty">
+                        <div className="sys-backup-empty-icon">📁</div>
+                        <div className="sys-backup-empty-text">Arşiv Boş</div>
+                        <div className="sys-backup-empty-hint">Henüz sistem yedeği oluşturulmamış.</div>
+                      </div>
+                    ) : backups.map((b, i) => (
+                      <div key={b.filename} className="sys-backup-card">
+                        <div className="sys-backup-card-top">
+                          <span className="sys-backup-number">#{backups.length - i}</span>
+                          <span className="sys-backup-size-badge">{b.size_mb} MB</span>
+                        </div>
+                        <div className="sys-backup-card-icon">📦</div>
+                        <div className="sys-backup-card-name" title={b.filename}>{b.filename}</div>
+                        <div className="sys-backup-card-date">{new Date(b.created_at).toLocaleDateString()}</div>
+                        <div className="sys-backup-card-actions">
+                          <button className="sys-backup-btn download" onClick={() => downloadBackup(b.filename)}>İndir</button>
+                          <button className="sys-backup-btn delete" onClick={() => deleteBackup(b.filename)}>✕</button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {systemTab === 'maintenance' && (
+                <div className="fade-in">
+                  <div className="sys-maintenance-card">
+                    <div>
+                      <div className="sys-maintenance-title">Manuel Arşivleme & Temizlik</div>
+                      <div className="sys-maintenance-desc">Tüm eski logları hemen yedekle ve veritabanını optimize et.</div>
+                    </div>
+                    <button className={`sys-run-btn ${isMaintenanceRunning ? 'loading' : ''}`}
+                      onClick={triggerMaintenance} disabled={isMaintenanceRunning}>
+                      {isMaintenanceRunning ? '🔄 Çalışıyor...' : '⚡ Başlat'}
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+            {systemToast && (
+              <div className={`sys-toast ${systemToast.type}`}>
+                {systemToast.type === 'success' ? '✅' : '❌'} {systemToast.msg}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -9,7 +9,7 @@ from database import init_db, engine
 from models import LogEntry as LogModel
 from app.services.websocket import manager
 from app.core.config import LOGSENSE_API_KEY, LLM_TIMEOUT_SECONDS
-from app.api import logs, alerts, stats, correlations
+from app.api import logs, alerts, stats, correlations, system
 
 # ──────────────────────────────────────────────
 # Logging Yapılandırması (Sadece Konsol)
@@ -66,3 +66,4 @@ app.include_router(logs.router)
 app.include_router(alerts.router)
 app.include_router(stats.router)
 app.include_router(correlations.router)
+app.include_router(system.router)
