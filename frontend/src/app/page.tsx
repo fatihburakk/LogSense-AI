@@ -233,20 +233,36 @@ export default function Dashboard() {
   const [timeRange, setTimeRange] = useState(0);
   const [logPage, setLogPage] = useState(1);
   const [alertPage, setAlertPage] = useState(1);
+  const [correlationPage, setCorrelationPage] = useState(1);
+  const [correlationSearchQuery, setCorrelationSearchQuery] = useState("");
+
+  const [showExportModal, setShowExportModal] = useState(false);
+  const [exportStartStr, setExportStartStr] = useState("");
+  const [exportEndStr, setExportEndStr] = useState("");
 
   // Alerts & Correlations State
   const [correlations, setCorrelations] = useState<CorrelationGroup[]>([]);
   const [alerts, setAlerts] = useState<AlertEntry[]>([]);
+  const [alertView, setAlertView] = useState<'active' | 'resolved' | 'false_positive'>('active');
 
-  const fetchAlerts = useCallback(async () => {
+  const fetchAlerts = useCallback(async (view: 'active' | 'resolved' | 'false_positive' = 'active') => {
     try {
-      const resp = await fetch(`${API_URL}/api/alerts?only_open=true`);
+      let url = `${API_URL}/api/alerts`;
+      if (view === 'active') url += '?only_open=true';
+      const resp = await fetch(url);
       const data = await resp.json();
-      if (Array.isArray(data)) setAlerts(data);
+      if (Array.isArray(data)) {
+        if (view === 'resolved') setAlerts(data.filter((a: AlertEntry) => a.is_resolved));
+        else if (view === 'false_positive') setAlerts(data.filter((a: AlertEntry) => a.is_false_positive));
+        else setAlerts(data);
+      }
     } catch (e) {
       console.error("Error fetching alerts:", e);
     }
   }, []);
+
+  // Re-fetch when view changes
+  useEffect(() => { fetchAlerts(alertView); }, [alertView, fetchAlerts]);
 
   const fetchCorrelations = useCallback(async () => {
     try {
@@ -291,8 +307,7 @@ export default function Dashboard() {
         return [e.detail, ...prev].sort((a, b) => a.age_seconds - b.age_seconds);
       });
     };
-    const handleNewAlert = () => fetchAlerts();
-
+    const handleNewAlert = () => fetchAlerts('active');
     window.addEventListener('new-correlation', handleCorrelation);
     window.addEventListener('new-alert', handleNewAlert);
     return () => {
@@ -349,6 +364,77 @@ export default function Dashboard() {
   useEffect(() => { if (alertPage > totalAlertPages) setAlertPage(1); }, [totalAlertPages, alertPage]);
   const paginatedAlerts = filteredAlerts.slice((alertPage - 1) * ALERTS_PER_PAGE, alertPage * ALERTS_PER_PAGE);
 
+  // Correlations Pagination & Filtering
+  const filteredCorrelations = useMemo(() => correlations.filter((corr) => {
+    if (correlationSearchQuery) {
+      const q = correlationSearchQuery.toLowerCase();
+      if (!corr.chain_label.toLowerCase().includes(q)) return false;
+    }
+    return true;
+  }), [correlations, correlationSearchQuery]);
+
+  const totalCorrelationPages = Math.max(1, Math.ceil(filteredCorrelations.length / ALERTS_PER_PAGE));
+  useEffect(() => { if (correlationPage > totalCorrelationPages) setCorrelationPage(1); }, [totalCorrelationPages, correlationPage]);
+  const paginatedCorrelations = filteredCorrelations.slice((correlationPage - 1) * ALERTS_PER_PAGE, correlationPage * ALERTS_PER_PAGE);
+
+  // Sharing & Export Helpers
+  const copyToClipboard = async (text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      alert("✅ Rapor panoya başarıyla kopyalandı!");
+    } catch (e) {
+      console.error("Panoya kopyalama başarısız", e);
+    }
+  };
+
+  const executeExportCSV = () => {
+    let dataToExport = logs;
+    if (exportStartStr) {
+      const startObj = new Date(exportStartStr);
+      dataToExport = dataToExport.filter(l => new Date(l.timestamp) >= startObj);
+    }
+    if (exportEndStr) {
+      const endObj = new Date(exportEndStr);
+      dataToExport = dataToExport.filter(l => new Date(l.timestamp) <= endObj);
+    }
+
+    const csvContent = "data:text/csv;charset=utf-8," 
+      + "Zaman;Seviye;Kaynak;Mesaj\n"
+      + dataToExport.map(l => `${l.timestamp};${l.level};${l.source};"${l.message.replace(/"/g, '""')}"`).join("\n");
+    
+    const encodedUri = encodeURI(csvContent);
+    const link = document.createElement("a");
+    link.setAttribute("href", encodedUri);
+    link.setAttribute("download", `logsense_export_${new Date().toISOString().slice(0,10)}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    setShowExportModal(false);
+  };
+
+  const setQuickDate = (days: number) => {
+    const end = new Date();
+    const start = new Date();
+    start.setDate(end.getDate() - days);
+    
+    const formatForInput = (d: Date) => {
+      return new Date(d.getTime() - (d.getTimezoneOffset() * 60000)).toISOString().slice(0, 16);
+    };
+    
+    setExportEndStr(formatForInput(end));
+    setExportStartStr(formatForInput(start));
+  };
+
+  const shareAlert = (alert: AlertEntry) => {
+    const text = `🚨 *LogSense Anomali Raporu* 🚨\n*Seviye:* ${alert.level}\n*Kaynak:* ${alert.source}\n*Zaman:* ${fmtTime(alert.timestamp)}\n\n*Mesaj:*\n\`\`\`\n${alert.message}\n\`\`\`\n\n🧠 *AI Kök Neden Analizi:*\n${alert.ai_analysis?.llm_analysis || "Analiz yok."}`;
+    copyToClipboard(text);
+  };
+
+  const shareCorrelation = (corr: CorrelationGroup) => {
+    const text = `🔗 *LogSense Korelasyon Raporu* 🔗\n*Zincir ID:* ${corr.group_id}\n*Etiket:* ${corr.chain_label}\n\n*Etki Özeti:*\n${corr.impact_summary || "Bilinmiyor."}\n\n*Bağlı Olaylar (${corr.event_count}):*\n${corr.events.map((e, i) => `${i+1}. [${e.source}] ${e.message} (${fmtTime(e.timestamp)})`).join('\n')}`;
+    copyToClipboard(text);
+  };
+
   const chartData = useMemo(() => buildChart(logs), [logs]);
   const sourceData = useMemo(() => buildSourceData(logs), [logs]);
   const severityData = useMemo(() => buildSeverityData(logs), [logs]);
@@ -361,7 +447,7 @@ export default function Dashboard() {
   const resolveAlert = async (id: number) => {
     try {
       await fetch(`${API_URL}/api/alerts/${id}/resolve`, {
-        method: "PATCH",
+        method: "POST",
         headers: { "X-API-KEY": API_KEY }
       });
       setAlerts(prev => prev.filter(a => a.id !== id));
@@ -374,7 +460,7 @@ export default function Dashboard() {
   const markFalse = async (id: number) => {
     try {
       await fetch(`${API_URL}/api/alerts/${id}/false-positive`, {
-        method: "PATCH",
+        method: "POST",
         headers: { "X-API-KEY": API_KEY }
       });
       setAlerts(prev => prev.filter(a => a.id !== id));
@@ -529,7 +615,11 @@ export default function Dashboard() {
                         <linearGradient id="gI" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor="#3b82f6" stopOpacity={0.4} /><stop offset="95%" stopColor="#3b82f6" stopOpacity={0} /></linearGradient>
                       </defs>
                       <CartesianGrid stroke="#1e293b" strokeDasharray="3 3" vertical={false} /><XAxis dataKey="time" stroke="#475569" fontSize={10} /><YAxis stroke="#475569" fontSize={10} />
-                      <Tooltip contentStyle={{ background: "#050505", border: "1px solid #1e293b", borderRadius: 8, fontSize: 12, color: "#fff" }} />
+                      <Tooltip 
+                        contentStyle={{ background: "var(--bg-card)", border: "1px solid var(--border-hover)", borderRadius: 8, fontSize: 12 }} 
+                        itemStyle={{ color: "var(--text-primary)" }}
+                        labelStyle={{ color: "var(--text-secondary)" }}
+                      />
                       <Area type="monotone" dataKey="info" stroke="#3b82f6" fill="url(#gI)" strokeWidth={2} name="Bilgi" />
                       <Area type="monotone" dataKey="warn" stroke="#f59e0b" fill="transparent" strokeWidth={2} name="Uyarı" />
                       <Area type="monotone" dataKey="error" stroke="#ef4444" fill="transparent" strokeWidth={2} name="Hata" />
@@ -541,7 +631,7 @@ export default function Dashboard() {
                   <ResponsiveContainer width="100%" height={240}>
                     <LineChart data={chartData}>
                       <CartesianGrid stroke="#1e293b" strokeDasharray="3 3" vertical={false} /><XAxis dataKey="time" stroke="#475569" fontSize={10} /><YAxis stroke="#475569" fontSize={10} domain={[0, 1]} />
-                      <Tooltip contentStyle={{ background: "#050505", border: "1px solid #c084fc", borderRadius: 8, fontSize: 12, color: "#fff" }} formatter={(v: any) => [(Number(v) * 100).toFixed(0) + "%", "Olasılık"]} />
+                      <Tooltip contentStyle={{ background: "var(--bg-card)", border: "1px solid #c084fc", borderRadius: 8, fontSize: 12 }} itemStyle={{ color: "var(--text-primary)" }} labelStyle={{ color: "var(--text-secondary)" }} formatter={(v: any) => [(Number(v) * 100).toFixed(0) + "%", "Olasılık"]} />
                       <ReferenceLine y={0.5} stroke="#ef4444" strokeDasharray="5 5" label={{ value: "Alarm Eşiği", fill: "#ef4444", fontSize: 10, position: 'right' }} />
                       <Line type="monotone" dataKey="maxScore" stroke="#c084fc" strokeWidth={3} dot={false} activeDot={{ r: 5 }} />
                     </LineChart>
@@ -558,7 +648,7 @@ export default function Dashboard() {
                       <Pie data={severityData} innerRadius={55} outerRadius={75} paddingAngle={5} dataKey="value" stroke="none">
                         {severityData.map((entry, index) => <Cell key={`c-${index}`} fill={entry.color} />)}
                       </Pie>
-                      <Tooltip contentStyle={{ background: "#050505", border: "1px solid #1e293b", borderRadius: 8, fontSize: 11 }} />
+                      <Tooltip contentStyle={{ background: "var(--bg-card)", border: "1px solid var(--border-hover)", borderRadius: 8, fontSize: 11 }} itemStyle={{ color: "var(--text-primary)" }} />
                       <Legend verticalAlign="bottom" height={36} iconType="circle" wrapperStyle={{ fontSize: 10 }} />
                     </PieChart>
                   </ResponsiveContainer>
@@ -570,7 +660,7 @@ export default function Dashboard() {
                       <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} />
                       <XAxis dataKey="name" stroke="#475569" fontSize={10} />
                       <YAxis stroke="#475569" fontSize={10} />
-                      <Tooltip contentStyle={{ background: "#050505", border: "1px solid #1e293b", borderRadius: 8, fontSize: 11 }} />
+                      <Tooltip contentStyle={{ background: "var(--bg-card)", border: "1px solid var(--border-hover)", borderRadius: 8, fontSize: 11 }} itemStyle={{ color: "var(--text-primary)" }} />
                       <Bar dataKey="value" fill="#22d3ee" barSize={24} radius={[4, 4, 0, 0]} />
                     </BarChart>
                   </ResponsiveContainer>
@@ -584,7 +674,7 @@ export default function Dashboard() {
                           <Cell key={`r-${index}`} fill={entry.name==='High'?'#ef4444':entry.name==='Medium'?'#f59e0b':'#22c55e'} />
                         ))}
                       </Pie>
-                      <Tooltip contentStyle={{ background: "#050505", border: "1px solid #1e293b", borderRadius: 8, fontSize: 11 }} />
+                      <Tooltip contentStyle={{ background: "var(--bg-card)", border: "1px solid var(--border-hover)", borderRadius: 8, fontSize: 11 }} itemStyle={{ color: "var(--text-primary)" }} />
                       <Legend verticalAlign="bottom" height={36} iconType="circle" wrapperStyle={{ fontSize: 10 }} />
                     </PieChart>
                   </ResponsiveContainer>
@@ -600,7 +690,12 @@ export default function Dashboard() {
                       <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" horizontal={true} vertical={false} />
                       <XAxis type="number" hide />
                       <YAxis dataKey="name" type="category" stroke="#94a3b8" fontSize={9} width={180} />
-                      <Tooltip cursor={{ fill: 'transparent' }} contentStyle={{ background: "#050505", border: "1px solid #ef4444", borderRadius: 8, fontSize: 11 }} />
+                      <Tooltip 
+                        cursor={{ fill: 'rgba(255,255,255,0.03)' }} 
+                        contentStyle={{ background: "var(--bg-card)", border: "1px solid #ef4444", borderRadius: 8, fontSize: 11 }} 
+                        itemStyle={{ color: "var(--text-primary)" }}
+                        labelStyle={{ color: "var(--text-secondary)", fontSize: 9 }}
+                      />
                       <Bar dataKey="value" fill="#ef4444" barSize={14} radius={[0, 4, 4, 0]} />
                     </BarChart>
                   </ResponsiveContainer>
@@ -618,6 +713,7 @@ export default function Dashboard() {
                   <div className="terminal-dots"><span className="dot r"></span><span className="dot y"></span><span className="dot g"></span></div>
                   <span className="terminal-uri">logsense://canli-akis — {filteredLogs.length} kayıt</span>
                   <div className="terminal-controls">
+                    <button className="term-btn export-btn" onClick={() => setShowExportModal(true)} title="CSV olarak dışa aktar">📥 Export CSV</button>
                     <span className="badge-live">● CANLI</span>
                     <button className="term-btn" onClick={clearAllHistory} title="Tüm geçmişi sil">🗑️ Temizle</button>
                   </div>
@@ -659,27 +755,92 @@ export default function Dashboard() {
           {/* ═══════ TAB: AI INSIGHTS ═══════ */}
           {activeTab === 'ai' && (
             <div className="tab-pane fade-in">
-              <FilterBar showLevel={false} />
+              {/* Archive Toggle Header */}
+              <div className="ai-archive-header">
+                <div className="ai-view-toggle">
+                  <button 
+                    className={`ai-view-btn ${alertView === 'active' ? 'active' : ''}`} 
+                    onClick={() => setAlertView('active')}
+                  >
+                    🔴 Aktif Anomaliler
+                    {alertView === 'active' && alerts.length > 0 && <span className="ai-view-count">{alerts.length}</span>}
+                  </button>
+                  <button 
+                    className={`ai-view-btn ${alertView === 'resolved' ? 'active resolved' : ''}`} 
+                    onClick={() => setAlertView('resolved')}
+                  >
+                    ✅ Çözülenler Arşivi
+                  </button>
+                  <button 
+                    className={`ai-view-btn ${alertView === 'false_positive' ? 'active false-pos' : ''}`} 
+                    onClick={() => setAlertView('false_positive')}
+                  >
+                    🚫 Hatalı Alarmlar
+                  </button>
+                </div>
+                <FilterBar showLevel={false} />
+              </div>
 
-              <div className="ai-grid">
+              {/* Dense Grid Layout */}
+              <div className="ai-grid-dense">
                 {paginatedAlerts.length === 0 ? (
-                  <div className="ai-empty"><span className="ai-empty-icon">🧠</span><h3>Sistem Temiz</h3><p>Anomali tespit edilmedi. AI motoru altyapınızı sürekli tarıyor.</p></div>
+                  <div className="ai-empty-full">
+                    <span className="ai-empty-icon">
+                      {alertView === 'active' ? '🧠' : alertView === 'resolved' ? '✅' : '🚫'}
+                    </span>
+                    <h3>
+                      {alertView === 'active' ? 'Sistem Temiz' : alertView === 'resolved' ? 'Çözülen Alarm Yok' : 'Hatalı Alarm Kaydı Yok'}
+                    </h3>
+                    <p>
+                      {alertView === 'active' 
+                        ? 'Anomali tespit edilmedi. AI motoru altyapınızı sürekli tarıyor.' 
+                        : alertView === 'resolved' 
+                        ? 'Henüz çözülen bir anomali kaydı bulunmuyor.'
+                        : 'Hatalı alarm olarak işaretlenmiş kayıt yok.'}
+                    </p>
+                  </div>
                 ) : paginatedAlerts.map((alert) => (
-                  <div key={alert.id} className={`ai-card ${alert.level}`} onClick={() => setSelectedAlert(alert)}>
-                    <div className="ai-card-top">
-                      <span className={`ai-level-tag ${alert.level}`}>{alert.level === "CRITICAL" ? "💀" : "🔴"} {alert.level}</span>
-                      <span className="ai-card-source">{alert.source}</span>
-                      <span className="ai-card-time">{fmtTime(alert.timestamp)}</span>
+                  <div key={alert.id} className={`ai-card-compact ${alert.level} ${alert.is_resolved ? 'resolved' : ''} ${alert.is_false_positive ? 'false-pos' : ''}`} onClick={() => setSelectedAlert(alert)}>
+                    {/* Status ribbon */}
+                    {alert.is_resolved && <div className="ai-card-ribbon resolved">✅ Çözüldü</div>}
+                    {alert.is_false_positive && <div className="ai-card-ribbon false-pos">🚫 Hatalı</div>}
+                    
+                    <div className="ai-card-compact-top">
+                      <span className={`ai-level-tag ${alert.level}`}>{alert.level === "CRITICAL" ? "💀" : alert.level === "ERROR" ? "🔴" : "⚠️"} {alert.level}</span>
+                      <span className="ai-card-source-badge">{alert.source}</span>
+                      {alert.ai_analysis && alert.ai_analysis.anomaly_score !== undefined && (
+                        <div className="ai-risk-badge" style={{ background: alert.ai_analysis.anomaly_score > 0.7 ? 'rgba(239, 68, 68, 0.2)' : 'rgba(245, 158, 11, 0.2)', color: alert.ai_analysis.anomaly_score > 0.7 ? '#fca5a5' : '#fcd34d' }}>
+                          %{(alert.ai_analysis.anomaly_score * 100).toFixed(0)} RİSK
+                        </div>
+                      )}
+                      <span className="ai-card-time-sm">{fmtTime(alert.timestamp)}</span>
                     </div>
-                    <div className="ai-card-message">{alert.message}</div>
-                    {/* Note: Fetch linked log's AI analysis for display in card if needed, or rely on alert message */}
-                    <div className="ai-card-actions">
-                      <button className="action-btn resolve" onClick={e => { e.stopPropagation(); resolveAlert(alert.id); }}>✅ Çözüldü</button>
-                      <button className="action-btn false-pos" onClick={e => { e.stopPropagation(); markFalse(alert.id); }}>🚫 Hatalı Alarm</button>
-                    </div>
+                    
+                    <div className="ai-card-compact-msg">{alert.message}</div>
+                    
+                    {alert.ai_analysis?.llm_analysis && (
+                      <div className="ai-card-llm-preview">
+                        🧠 {alert.ai_analysis.llm_analysis.substring(0, 120)}{alert.ai_analysis.llm_analysis.length > 120 ? '...' : ''}
+                      </div>
+                    )}
+                    
+                    {alert.ai_analysis?.anomaly_score !== undefined && (
+                      <div className="ai-card-score-bar">
+                        <div className="score-bar-fill" style={{ width: `${alert.ai_analysis.anomaly_score * 100}%`, background: alert.ai_analysis.anomaly_score > 0.7 ? '#ef4444' : alert.ai_analysis.anomaly_score > 0.4 ? '#f59e0b' : '#22c55e' }} />
+                        <span className="score-bar-label">{(alert.ai_analysis.anomaly_score * 100).toFixed(0)}% Risk</span>
+                      </div>
+                    )}
+
+                    {alertView === 'active' && (
+                      <div className="ai-card-compact-actions">
+                        <button className="action-btn-sm resolve" onClick={e => { e.stopPropagation(); resolveAlert(alert.id); }}>✅ Çözüldü</button>
+                        <button className="action-btn-sm false-pos" onClick={e => { e.stopPropagation(); markFalse(alert.id); }}>🚫 Hatalı</button>
+                      </div>
+                    )}
                   </div>
                 ))}
               </div>
+              
               {totalAlertPages > 1 && (
                 <div className="pagination-bar" style={{ marginTop: 16 }}>
                   <button className="page-btn" onClick={() => setAlertPage(p => Math.max(1, p - 1))}>◀</button>
@@ -693,32 +854,91 @@ export default function Dashboard() {
           {/* ═══════ TAB: CORRELATIONS ═══════ */}
           {activeTab === 'correlations' && (
             <div className="tab-pane fade-in">
-              {correlations.length === 0 ? (
-                <div className="ai-empty"><span className="ai-empty-icon">🔗</span><h3>Korelasyon Bulunmuyor</h3><p>Şu anda olaylar arasında herhangi bir nedensellik zinciri tespit edilmedi.</p></div>
+              {filteredCorrelations.length === 0 ? (
+                <div className="ai-empty-full">
+                  <span className="ai-empty-icon">🔗</span>
+                  <h3>Korelasyon Tespit Edilmedi</h3>
+                  <p>Şu anda olaylar arasında herhangi bir nedensellik veya tetikleme zinciri bulunmuyor.</p>
+                </div>
               ) : (
-                <div className="correlations-grid" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, maxHeight: 'none', overflowY: 'visible' }}>
-                  {correlations.map(corr => (
-                    <div key={corr.group_id} className="correlation-card"
-                      onClick={() => setSelectedCorrelation(corr)}
-                      style={{ background: 'rgba(57,210,192,0.05)', border: '1px solid rgba(57,210,192,0.2)', borderLeft: '3px solid var(--accent-cyan)', borderRadius: 8, padding: 16, cursor: 'pointer', transition: '0.2s' }}>
-                      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 12 }}>
-                        <span style={{ fontSize: '0.85rem', fontWeight: 700, color: 'var(--accent-cyan)' }}>{corr.group_id}</span>
-                        <span style={{ fontSize: '0.7rem', color: 'var(--text-dim)', background: 'rgba(0,0,0,0.2)', padding: '2px 8px', borderRadius: 12 }}>{corr.event_count} olay bağlandı</span>
-                      </div>
-                      <div style={{ fontSize: '0.9rem', color: 'var(--text-primary)', marginBottom: 10 }}>{corr.chain_label}</div>
-                      {corr.impact_summary && (
-                        <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', background: 'rgba(0,0,0,0.2)', padding: 8, borderRadius: 4 }}>
-                          {corr.impact_summary}
-                        </div>
-                      )}
+                <div className="corr-trace-container fade-in">
+                  <div className="corr-trace-header">
+                    <div className="corr-trace-title">Nedensellik & Zincirleme Hata Analizi</div>
+                    <div className="corr-trace-subtitle">Sistem, farklı kaynaklardan gelen logları zaman ve içerik bazlı otomatik bağlar.</div>
+                    <div className="filter-search" style={{ marginTop: 12, maxWidth: 300 }}>
+                      <span className="filter-icon">🔎</span>
+                      <input type="text" className="filter-input" placeholder="Zincirlerde ara..." value={correlationSearchQuery} onChange={e => setCorrelationSearchQuery(e.target.value)} />
                     </div>
-                  ))}
+                  </div>
+                  
+                  <div className="corr-trace-list">
+                    {paginatedCorrelations.map(corr => (
+                      <div key={corr.group_id} className="corr-trace-item" onClick={() => setSelectedCorrelation(corr)}>
+                        <div className="corr-trace-left">
+                          <div className="corr-trace-line"></div>
+                          <div className="corr-trace-node"></div>
+                        </div>
+                        <div className="corr-trace-content">
+                          <div className="corr-trace-meta">
+                            <span className="corr-trace-id">Zincir #{corr.group_id.split('-')[0]}</span>
+                            <span className="corr-trace-count">{corr.event_count} Bağlı Olay</span>
+                          </div>
+                          <div className="corr-trace-label">{corr.chain_label}</div>
+                          {corr.impact_summary && (
+                            <div className="corr-trace-impact">{corr.impact_summary}</div>
+                          )}
+                        </div>
+                        <div className="corr-trace-action">
+                          <button className="corr-view-btn">Detay İncele ➔</button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  {totalCorrelationPages > 1 && (
+                    <div className="pagination-bar" style={{ marginTop: 16 }}>
+                      <button className="page-btn" onClick={() => setCorrelationPage(p => Math.max(1, p - 1))}>◀</button>
+                      <span className="page-info">{correlationPage} / {totalCorrelationPages}</span>
+                      <button className="page-btn" onClick={() => setCorrelationPage(p => Math.min(totalCorrelationPages, p + 1))}>▶</button>
+                    </div>
+                  )}
                 </div>
               )}
             </div>
           )}
         </main>
       </div>
+
+      {/* ═══════ MODAL: Export CSV ═══════ */}
+      {showExportModal && (
+        <div className="modal-overlay" onClick={() => setShowExportModal(false)}>
+          <div className="modal-content alert-modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 400 }}>
+            <div className="modal-header">
+              <span className="modal-title">📥 Gelişmiş CSV Dışa Aktarım</span>
+              <button className="modal-close" onClick={() => setShowExportModal(false)}>✕</button>
+            </div>
+            <div className="modal-body">
+              <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', marginBottom: 12 }}>
+                Dışa aktarmak istediğiniz kayıtların tarih aralığını belirleyin. (Boş bırakırsanız mevcut tüm kayıtlar aktarılır. Veriler Excel uyumlu sütun ayracı ile indirilecektir.)
+              </p>
+              <div style={{ display: 'flex', gap: 6, marginBottom: 16 }}>
+                <button className="level-btn" style={{ flex: 1, padding: '4px', fontSize: '0.75rem' }} onClick={(e) => { e.preventDefault(); setQuickDate(1); }}>Günlük</button>
+                <button className="level-btn" style={{ flex: 1, padding: '4px', fontSize: '0.75rem' }} onClick={(e) => { e.preventDefault(); setQuickDate(7); }}>Haftalık</button>
+                <button className="level-btn" style={{ flex: 1, padding: '4px', fontSize: '0.75rem' }} onClick={(e) => { e.preventDefault(); setQuickDate(30); }}>Aylık</button>
+              </div>
+              <div className="modal-field" style={{ flexDirection: 'column', alignItems: 'flex-start' }}>
+                <span className="modal-label" style={{ marginBottom: 4 }}>Başlangıç Tarihi</span>
+                <input type="datetime-local" className="filter-input" style={{ width: '100%', fontSize: '0.9rem' }} value={exportStartStr} onChange={e => setExportStartStr(e.target.value)} />
+              </div>
+              <div className="modal-field" style={{ flexDirection: 'column', alignItems: 'flex-start', marginTop: 12 }}>
+                <span className="modal-label" style={{ marginBottom: 4 }}>Bitiş Tarihi</span>
+                <input type="datetime-local" className="filter-input" style={{ width: '100%', fontSize: '0.9rem' }} value={exportEndStr} onChange={e => setExportEndStr(e.target.value)} />
+              </div>
+              <div className="modal-divider" style={{ marginTop: 24 }}></div>
+              <button className="alert-popup-action-btn export" style={{ width: '100%' }} onClick={executeExportCSV}>✅ CSV İndir</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ═══════ MODAL: Log Detail ═══════ */}
       {selectedLog && (
@@ -809,8 +1029,13 @@ export default function Dashboard() {
 
               <div className="modal-divider"></div>
               <div className="alert-popup-actions">
-                <button className="alert-popup-action-btn resolve" onClick={() => resolveAlert(selectedAlert.id)}>✅ Çözüldü İşaretle</button>
-                <button className="alert-popup-action-btn false-positive" onClick={() => markFalse(selectedAlert.id)}>🚫 Hatalı Alarm İşaretle</button>
+                {alertView === 'active' && (
+                  <>
+                    <button className="alert-popup-action-btn resolve" onClick={() => resolveAlert(selectedAlert.id)}>✅ Çözüldü İşaretle</button>
+                    <button className="alert-popup-action-btn false-positive" onClick={() => markFalse(selectedAlert.id)}>🚫 Hatalı Alarm İşaretle</button>
+                  </>
+                )}
+                <button className="alert-popup-action-btn export" onClick={() => shareAlert(selectedAlert)}>📤 Kopyala (Share)</button>
               </div>
             </div>
           </div>
@@ -823,7 +1048,10 @@ export default function Dashboard() {
           <div className="modal-content" onClick={e => e.stopPropagation()} style={{ maxWidth: 720 }}>
             <div className="modal-header" style={{ background: 'linear-gradient(135deg, rgba(57,210,192,0.1), rgba(13,17,23,0.8))' }}>
               <span className="modal-title" style={{ color: 'var(--accent-cyan)' }}>🔗 Korelasyon: {selectedCorrelation.group_id}</span>
-              <button className="modal-close" onClick={() => setSelectedCorrelation(null)}>✕</button>
+              <div style={{ display: 'flex', gap: 12 }}>
+                <button className="corr-view-btn" onClick={() => shareCorrelation(selectedCorrelation)}>📤 Kopyala</button>
+                <button className="modal-close" onClick={() => setSelectedCorrelation(null)}>✕</button>
+              </div>
             </div>
             <div className="modal-body">
               <div style={{ padding: '12px 16px', background: 'var(--bg-terminal)', borderRadius: 8, border: '1px solid var(--border-primary)', marginBottom: 8 }}>
