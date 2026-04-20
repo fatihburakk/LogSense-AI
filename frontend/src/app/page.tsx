@@ -1,346 +1,165 @@
 "use client";
 
-import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+// ──────────────────────────────────────────────
+// LogSense AI — Ana Orkestratör Sayfası
+// Tüm bileşenler src/components/ altında organize edilmiştir.
+// Bu dosya yalnızca global state ve koordinasyonu yönetir.
+// ──────────────────────────────────────────────
+
+import { useState, useEffect, useCallback, useMemo } from "react";
+
+// Types
 import {
-  XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
-  Area, AreaChart, LineChart, Line, ReferenceLine,
-  BarChart, Bar, PieChart, Pie, Cell, Legend
-} from "recharts";
+  LogEntry,
+  AlertEntry,
+  CorrelationGroup,
+  SystemSettings,
+  BackupEntry,
+  AlertView,
+  ActiveTab,
+  Theme,
+  SystemTab,
+} from "@/types";
+
+// Hooks
+import { useWebSocket } from "@/hooks/useWebSocket";
+
+// Lib
+import { minsAgo } from "@/lib/utils";
+import {
+  buildChart,
+  buildSeverityData,
+  buildHttpData,
+  buildRiskData,
+  buildTopErrorsData,
+} from "@/lib/chartBuilders";
+
+// Layout
+import Sidebar from "@/components/layout/Sidebar";
+import Header from "@/components/layout/Header";
+
+// Tabs
+import OverviewTab from "@/components/tabs/OverviewTab";
+import LiveStreamTab from "@/components/tabs/LiveStreamTab";
+import AIAnalysisTab from "@/components/tabs/AIAnalysisTab";
+import CorrelationsTab from "@/components/tabs/CorrelationsTab";
+
+// Modals
+import LogDetailModal from "@/components/modals/LogDetailModal";
+import AlertDetailModal from "@/components/modals/AlertDetailModal";
+import CorrelationModal from "@/components/modals/CorrelationModal";
+import ExportModal from "@/components/modals/ExportModal";
+import SystemSettingsModal from "@/components/modals/SystemSettingsModal";
 
 // ──────────────────────────────────────────────
-// Configuration from Environment
+// Ortam Değişkenleri
 // ──────────────────────────────────────────────
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000";
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://127.0.0.1:8000";
 const API_KEY = process.env.NEXT_PUBLIC_LOGSENSE_API_KEY || "";
 
-// ──────────────────────────────────────────────
-// Types & Constants
-// ──────────────────────────────────────────────
-interface EnrichmentData {
-  ip_info?: { ip: string; city: string; country: string; region: string; risk_level: string };
-  http_info?: { code: number; type: string; severity: string; desc: string };
-  error_category?: { category: string; domain: string };
-  tags?: string[];
-}
-interface AIAnalysis {
-  model_used: string;
-  ml_prediction: "anomaly" | "normal";
-  anomaly_score: number;
-  llm_analysis: string | null;
-}
-interface LogEntry {
-  id?: number;
-  timestamp: string;
-  level: string;
-  message: string;
-  source: string;
-  ai_analysis?: AIAnalysis;
-  enrichment?: EnrichmentData;
-}
-interface AlertEntry {
-  id: number;
-  log_id: number;
-  level: string;
-  source: string;
-  message: string;
-  timestamp: string;
-  is_resolved: boolean;
-  is_false_positive: boolean;
-  ai_analysis?: AIAnalysis; // UI hint
-}
-interface CorrelationGroup {
-  group_id: string;
-  chain_type: string;
-  chain_label: string;
-  event_count: number;
-  events: Array<{ timestamp: string; level: string; source: string; message: string; role: string }>;
-  root_cause: string | null;
-  impact_summary: string | null;
-  age_seconds: number;
-}
-interface ChartPoint { time: string; info: number; warn: number; error: number; maxScore: number; }
-
 const LOGS_PER_PAGE = 50;
 const ALERTS_PER_PAGE = 8;
 
 // ──────────────────────────────────────────────
-// WebSocket Hook
-// ──────────────────────────────────────────────
-function useWebSocket(url: string) {
-  const [logs, setLogs] = useState<LogEntry[]>([]);
-  const [connected, setConnected] = useState(false);
-  const wsRef = useRef<WebSocket | null>(null);
-  const reconnect = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  const connect = useCallback(() => {
-    try {
-      const ws = new WebSocket(url);
-      wsRef.current = ws;
-      ws.onopen = () => setConnected(true);
-      ws.onmessage = (e) => {
-        const p = JSON.parse(e.data);
-        if (p.type === "history") setLogs(p.data.reverse());
-        else if (p.type === "log") {
-          setLogs((prev) => [p.data, ...prev.slice(0, 999)]);
-          // If it's an anomaly, notify Dashboard to refresh alerts
-          if (p.data.ai_analysis?.ml_prediction === "anomaly") {
-            window.dispatchEvent(new CustomEvent('new-alert', { detail: p.data }));
-          }
-        }
-        else if (p.type === "llm_update") {
-          setLogs((prev) => prev.map(log =>
-            log.id === p.log_id
-              ? { ...log, ai_analysis: { ...log.ai_analysis, llm_analysis: p.llm_analysis } as AIAnalysis }
-              : log
-          ));
-          window.dispatchEvent(new CustomEvent('update-alert', { detail: p }));
-        }
-        else if (p.type === "correlation") {
-          window.dispatchEvent(new CustomEvent('new-correlation', { detail: p.data }));
-        }
-      };
-      ws.onclose = () => { setConnected(false); reconnect.current = setTimeout(connect, 3000); };
-      ws.onerror = () => ws.close();
-    } catch { reconnect.current = setTimeout(connect, 3000); }
-  }, [url]);
-
-  useEffect(() => {
-    connect();
-    return () => { wsRef.current?.close(); if (reconnect.current) clearTimeout(reconnect.current); };
-  }, [connect]);
-
-  return { logs, connected, clearLogs: useCallback(() => setLogs([]), []) };
-}
-
-// ──────────────────────────────────────────────
-// Helpers
-// ──────────────────────────────────────────────
-function fmtTime(iso: string) {
-  try { return new Date(iso).toLocaleTimeString("en-US", { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" }); }
-  catch { return "--:--:--"; }
-}
-function minsAgo(iso: string) { return (Date.now() - new Date(iso).getTime()) / 60000; }
-function scoreLevel(s: number) { return s >= 0.8 ? "critical" : s >= 0.5 ? "high" : s >= 0.3 ? "medium" : "low"; }
-
-function buildChart(logs: LogEntry[]): ChartPoint[] {
-  const b: Record<string, ChartPoint> = {};
-  logs.forEach((l) => {
-    const k = fmtTime(l.timestamp).substring(0, 5);
-    if (!b[k]) b[k] = { time: k, info: 0, warn: 0, error: 0, maxScore: 0 };
-    if (l.level === "INFO") b[k].info++;
-    else if (l.level === "WARN") b[k].warn++;
-    else if (l.level === "ERROR" || l.level === "CRITICAL") b[k].error++;
-    if (l.ai_analysis) b[k].maxScore = Math.max(b[k].maxScore, l.ai_analysis.anomaly_score);
-  });
-  return Object.values(b).slice(-20);
-}
-
-function buildSourceData(logs: LogEntry[]) {
-  const counts: Record<string, number> = {};
-  logs.forEach(l => { counts[l.source] = (counts[l.source] || 0) + 1; });
-  return Object.entries(counts).map(([name, value]) => ({ name, value })).sort((a, b) => b.value - a.value);
-}
-
-function buildSeverityData(logs: LogEntry[]) {
-  const s = { INFO: 0, WARN: 0, ERROR: 0, CRITICAL: 0 };
-  logs.forEach(l => { if (l.level in s) s[l.level as keyof typeof s]++; });
-  return [
-    { name: "Info", value: s.INFO, color: "#3b82f6" },
-    { name: "Warn", value: s.WARN, color: "#f59e0b" },
-    { name: "Error", value: s.ERROR, color: "#ef4444" },
-    { name: "Critical", value: s.CRITICAL, color: "#7f1d1d" },
-  ].filter(x => x.value > 0);
-}
-
-function buildHttpData(logs: LogEntry[]) {
-  const counts: Record<string, number> = { "2xx": 0, "4xx": 0, "5xx": 0 };
-  logs.forEach(l => {
-    const code = l.enrichment?.http_info?.code;
-    if (code) {
-      if (code >= 200 && code < 300) counts["2xx"]++;
-      else if (code >= 400 && code < 500) counts["4xx"]++;
-      else if (code >= 500) counts["5xx"]++;
-    }
-  });
-  return Object.entries(counts).map(([name, value]) => ({ name, value })).filter(x => x.value > 0);
-}
-
-function buildRiskData(logs: LogEntry[]) {
-  const counts: Record<string, number> = { "Low": 0, "Medium": 0, "High": 0 };
-  logs.forEach(l => {
-    const risk = l.enrichment?.ip_info?.risk_level;
-    if (risk) {
-      const key = risk.charAt(0).toUpperCase() + risk.slice(1);
-      if (key in counts) counts[key]++;
-    }
-  });
-  return Object.entries(counts).map(([name, value]) => ({ name, value })).filter(x => x.value > 0);
-}
-
-function buildTopErrorsData(logs: LogEntry[]) {
-  const counts: Record<string, number> = {};
-  logs.forEach(l => {
-    if (l.level === "ERROR" || l.level === "CRITICAL") {
-      // Mesajı normalize et: ID'ler ve zaman damgaları gibi değişken kısımları temizlemeye çalış
-      const cleanMsg = l.message.replace(/\d+/g, 'X').substring(0, 60) + "...";
-      counts[cleanMsg] = (counts[cleanMsg] || 0) + 1;
-    }
-  });
-  return Object.entries(counts)
-    .map(([name, value]) => ({ name, value }))
-    .sort((a, b) => b.value - a.value)
-    .slice(0, 5);
-}
-
-function buildAnomalyStatusData(alerts: AlertEntry[]) {
-  const total = alerts.length;
-  // Note: Since alerts in state are usually 'only_open', this might need adjustment if history is kept
-  return [
-    { name: "Aktif", value: alerts.filter(a => !a.is_resolved).length, color: "#ef4444" },
-    { name: "Çözüldü", value: alerts.filter(a => a.is_resolved).length, color: "#22c55e" },
-  ].filter(x => x.value > 0);
-}
-
-// ──────────────────────────────────────────────
-// Dashboard
+// Dashboard — Ana Koordinatör Bileşen
 // ──────────────────────────────────────────────
 export default function Dashboard() {
   const { logs, connected, clearLogs } = useWebSocket(`${WS_URL}/ws/logs`);
-  const [activeTab, setActiveTab] = useState<"overview" | "logs" | "ai" | "correlations">("overview");
-  const [theme, setTheme] = useState<"dark" | "light">("dark");
-  const [sending, setSending] = useState(false);
 
-  // Theme support
+  // Navigasyon & Tema
+  const [activeTab, setActiveTab] = useState<ActiveTab>("overview");
+  const [theme, setTheme] = useState<Theme>("dark");
+
+  // Tema yönetimi
   useEffect(() => {
-    const savedTheme = localStorage.getItem("theme") as "dark" | "light" | null;
-    if (savedTheme) setTheme(savedTheme);
+    const saved = localStorage.getItem("theme") as Theme | null;
+    if (saved) setTheme(saved);
   }, []);
-
   useEffect(() => {
-    if (theme === "light") {
-      document.documentElement.classList.add("light-theme");
-    } else {
-      document.documentElement.classList.remove("light-theme");
-    }
+    if (theme === "light") document.documentElement.classList.add("light-theme");
+    else document.documentElement.classList.remove("light-theme");
     localStorage.setItem("theme", theme);
   }, [theme]);
 
-  // Shared Filters
+  // Filtreler
   const [levelFilter, setLevelFilter] = useState<string | null>(null);
   const [sourceFilter, setSourceFilter] = useState("all");
   const [searchQuery, setSearchQuery] = useState("");
   const [timeRange, setTimeRange] = useState(0);
+
+  // Sayfalama
   const [logPage, setLogPage] = useState(1);
   const [alertPage, setAlertPage] = useState(1);
   const [correlationPage, setCorrelationPage] = useState(1);
   const [correlationSearchQuery, setCorrelationSearchQuery] = useState("");
 
+  // Modal görünürlüğü
   const [showExportModal, setShowExportModal] = useState(false);
-  const [exportStartStr, setExportStartStr] = useState("");
-  const [exportEndStr, setExportEndStr] = useState("");
-
-  // Alerts & Correlations State
-  const [correlations, setCorrelations] = useState<CorrelationGroup[]>([]);
-  const [alerts, setAlerts] = useState<AlertEntry[]>([]);
-  const [alertView, setAlertView] = useState<'active' | 'resolved' | 'false_positive'>('active');
-
-  // System Management State
   const [showSystemModal, setShowSystemModal] = useState(false);
-  const [systemTab, setSystemTab] = useState<'settings' | 'backups' | 'maintenance'>('settings');
-  const [systemSettings, setSystemSettings] = useState({ retention_days: 15, auto_backup: true });
-  const [backups, setBackups] = useState<any[]>([]);
+
+  // Seçili modalların içeriği
+  const [selectedLog, setSelectedLog] = useState<LogEntry | null>(null);
+  const [selectedAlert, setSelectedAlert] = useState<AlertEntry | null>(null);
+  const [selectedCorrelation, setSelectedCorrelation] = useState<CorrelationGroup | null>(null);
+
+  // Veri state'leri
+  const [alerts, setAlerts] = useState<AlertEntry[]>([]);
+  const [alertView, setAlertView] = useState<AlertView>("active");
+  const [correlations, setCorrelations] = useState<CorrelationGroup[]>([]);
+
+  // Sistem yönetimi state'leri
+  const [systemTab, setSystemTab] = useState<SystemTab>("settings");
+  const [systemSettings, setSystemSettings] = useState<SystemSettings>({ retention_days: 15, auto_backup: true });
+  const [backups, setBackups] = useState<BackupEntry[]>([]);
   const [isMaintenanceRunning, setIsMaintenanceRunning] = useState(false);
-  const [systemToast, setSystemToast] = useState<{ type: 'success' | 'error', msg: string } | null>(null);
+  const [systemToast, setSystemToast] = useState<{ type: "success" | "error"; msg: string } | null>(null);
+  const [sending, setSending] = useState(false);
 
-  const fetchSystemSettings = useCallback(async () => {
-    try {
-      const resp = await fetch(`${API_URL}/api/system/settings`);
-      const data = await resp.json();
-      if (data) setSystemSettings(data);
-    } catch (e) {
-      console.error("Error fetching system settings:", e);
-    }
-  }, []);
+  // Modal açıkken body scroll kilitle
+  useEffect(() => {
+    document.body.style.overflow =
+      selectedLog || selectedAlert || selectedCorrelation ? "hidden" : "";
+    return () => { document.body.style.overflow = ""; };
+  }, [selectedLog, selectedAlert, selectedCorrelation]);
 
-  const updateSystemSettings = async (updates: any) => {
-    try {
-      const resp = await fetch(`${API_URL}/api/system/settings`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(updates)
-      });
-      const data = await resp.json();
-      if (data) setSystemSettings(data);
-    } catch (e) {
-      console.error("Error updating system settings:", e);
-    }
-  };
-
-  const fetchBackups = useCallback(async () => {
-    try {
-      const resp = await fetch(`${API_URL}/api/system/backups`);
-      const data = await resp.json();
-      if (Array.isArray(data)) setBackups(data);
-    } catch (e) {
-      console.error("Error fetching backups:", e);
-    }
-  }, []);
-
-  const downloadBackup = (filename: string) => {
-    window.open(`${API_URL}/api/system/backups/${filename}/download`, '_blank');
-  };
-
-  const deleteBackup = async (filename: string) => {
-    if (!confirm(`${filename} dosyasını kalıcı olarak silmek istediğinize emin misiniz?`)) return;
-    try {
-      await fetch(`${API_URL}/api/system/backups/${filename}`, { method: 'DELETE' });
-      fetchBackups();
-    } catch (e) {
-      console.error("Error deleting backup:", e);
-    }
-  };
-
-  const triggerMaintenance = async () => {
-    setIsMaintenanceRunning(true);
-    try {
-      await fetch(`${API_URL}/api/system/maintenance`, { method: 'POST' });
-      alert("Bakım görevi başlatıldı! İşlem arka planda yürütülüyor.");
-      setTimeout(fetchBackups, 3000);
-    } catch (e) {
-      console.error("Error triggering maintenance:", e);
-    } finally {
-      setIsMaintenanceRunning(false);
-    }
-  };
-
-  const fetchAlerts = useCallback(async (view: 'active' | 'resolved' | 'false_positive' = 'active') => {
+  // ── API Çağrıları ──
+  const fetchAlerts = useCallback(async (view: AlertView = "active") => {
     try {
       let url = `${API_URL}/api/alerts`;
-      if (view === 'active') url += '?only_open=true';
+      if (view === "active") url += "?only_open=true";
       const resp = await fetch(url);
       const data = await resp.json();
       if (Array.isArray(data)) {
-        if (view === 'resolved') setAlerts(data.filter((a: AlertEntry) => a.is_resolved));
-        else if (view === 'false_positive') setAlerts(data.filter((a: AlertEntry) => a.is_false_positive));
+        if (view === "resolved") setAlerts(data.filter((a: AlertEntry) => a.is_resolved));
+        else if (view === "false_positive") setAlerts(data.filter((a: AlertEntry) => a.is_false_positive));
         else setAlerts(data);
       }
-    } catch (e) {
-      console.error("Error fetching alerts:", e);
-    }
+    } catch (e) { console.error("fetchAlerts:", e); }
   }, []);
-
-  // Re-fetch when view changes
-  useEffect(() => { fetchAlerts(alertView); }, [alertView, fetchAlerts]);
 
   const fetchCorrelations = useCallback(async () => {
     try {
       const resp = await fetch(`${API_URL}/api/history/correlations`);
       const data = await resp.json();
       if (Array.isArray(data)) setCorrelations(data);
-    } catch (e) {
-      console.error("Error fetching correlation history:", e);
-    }
+    } catch (e) { console.error("fetchCorrelations:", e); }
+  }, []);
+
+  const fetchSystemSettings = useCallback(async () => {
+    try {
+      const resp = await fetch(`${API_URL}/api/system/settings`);
+      const data = await resp.json();
+      if (data) setSystemSettings(data);
+    } catch (e) { console.error("fetchSystemSettings:", e); }
+  }, []);
+
+  const fetchBackups = useCallback(async () => {
+    try {
+      const resp = await fetch(`${API_URL}/api/system/backups`);
+      const data = await resp.json();
+      if (Array.isArray(data)) setBackups(data);
+    } catch (e) { console.error("fetchBackups:", e); }
   }, []);
 
   useEffect(() => {
@@ -350,197 +169,108 @@ export default function Dashboard() {
     fetchBackups();
   }, [fetchAlerts, fetchCorrelations, fetchSystemSettings, fetchBackups]);
 
-  const clearAllHistory = useCallback(async () => {
-    try {
-      if (!confirm("Tüm log, anomali ve AI analiz geçmişini silmek istediğinize emin misiniz?")) return;
+  useEffect(() => { fetchAlerts(alertView); }, [alertView, fetchAlerts]);
 
-      const resp = await fetch(`${API_URL}/api/history/clear-all`, { method: "DELETE" });
-      if (resp.ok) {
-        clearLogs(); // Local logs state'i temizle
-        setAlerts([]); // Local alerts state'i temizle
-        setCorrelations([]); // Local correlations state'i temizle
-      }
-    } catch (e) {
-      console.error("Error clearing history:", e);
-    }
-  }, [clearLogs]);
-
-  // Handle incoming live alerts/correlations
+  // Canlı WebSocket olayları
   useEffect(() => {
-    const handleCorrelation = (e: any) => {
-      setCorrelations(prev => {
-        const idx = prev.findIndex(g => g.group_id === e.detail.group_id);
+    const handleCorrelation = (e: Event) => {
+      const corr = (e as CustomEvent).detail;
+      setCorrelations((prev) => {
+        const idx = prev.findIndex((g) => g.group_id === corr.group_id);
         if (idx !== -1) {
-          const newGroups = [...prev];
-          newGroups[idx] = e.detail;
-          return newGroups.sort((a, b) => a.age_seconds - b.age_seconds);
+          const next = [...prev];
+          next[idx] = corr;
+          return next.sort((a, b) => a.age_seconds - b.age_seconds);
         }
-        return [e.detail, ...prev].sort((a, b) => a.age_seconds - b.age_seconds);
+        return [corr, ...prev].sort((a, b) => a.age_seconds - b.age_seconds);
       });
     };
-    const handleNewAlert = () => fetchAlerts('active');
-    window.addEventListener('new-correlation', handleCorrelation);
-    window.addEventListener('new-alert', handleNewAlert);
+    const handleNewAlert = () => fetchAlerts("active");
+    window.addEventListener("new-correlation", handleCorrelation);
+    window.addEventListener("new-alert", handleNewAlert);
     return () => {
-      window.removeEventListener('new-correlation', handleCorrelation);
-      window.removeEventListener('new-alert', handleNewAlert);
+      window.removeEventListener("new-correlation", handleCorrelation);
+      window.removeEventListener("new-alert", handleNewAlert);
     };
   }, [fetchAlerts]);
 
-  // Modals
-  const [selectedLog, setSelectedLog] = useState<LogEntry | null>(null);
-  const [selectedAlert, setSelectedAlert] = useState<AlertEntry | null>(null);
-  const [selectedCorrelation, setSelectedCorrelation] = useState<CorrelationGroup | null>(null);
-
-  useEffect(() => {
-    document.body.style.overflow = (selectedLog || selectedAlert || selectedCorrelation) ? "hidden" : "";
-    return () => { document.body.style.overflow = ""; };
-  }, [selectedLog, selectedAlert, selectedCorrelation]);
-
-  const uniqueSources = useMemo(() => Array.from(new Set(logs.map(l => l.source))).sort(), [logs]);
-
-  const filteredLogs = useMemo(() => logs.filter(log => {
-    if (levelFilter && log.level !== levelFilter) return false;
-    if (sourceFilter !== "all" && log.source !== sourceFilter) return false;
-    if (searchQuery) {
-      const q = searchQuery.toLowerCase();
-      if (!log.message.toLowerCase().includes(q) && !log.source.toLowerCase().includes(q)) return false;
-    }
-    if (timeRange > 0 && minsAgo(log.timestamp) > timeRange) return false;
-    return true;
-  }), [logs, levelFilter, sourceFilter, searchQuery, timeRange]);
-
-  const totalLogPages = Math.max(1, Math.ceil(filteredLogs.length / LOGS_PER_PAGE));
-  useEffect(() => { if (logPage > totalLogPages) setLogPage(1); }, [totalLogPages, logPage]);
-  const paginatedLogs = filteredLogs.slice((logPage - 1) * LOGS_PER_PAGE, logPage * LOGS_PER_PAGE);
-
-  const stats = useMemo(() => ({
-    total: logs.length,
-    info: logs.filter(l => l.level === "INFO").length,
-    warn: logs.filter(l => l.level === "WARN").length,
-    error: logs.filter(l => l.level === "ERROR" || l.level === "CRITICAL").length,
-    anomalies: alerts.length,
-  }), [logs, alerts]);
-
-  const filteredAlerts = useMemo(() => alerts.filter((alert) => {
-    if (sourceFilter !== "all" && alert.source !== sourceFilter) return false;
-    if (searchQuery) {
-      const q = searchQuery.toLowerCase();
-      if (!alert.message.toLowerCase().includes(q)) return false;
-    }
-    return true;
-  }), [alerts, sourceFilter, searchQuery]);
-
-  const totalAlertPages = Math.max(1, Math.ceil(filteredAlerts.length / ALERTS_PER_PAGE));
-  useEffect(() => { if (alertPage > totalAlertPages) setAlertPage(1); }, [totalAlertPages, alertPage]);
-  const paginatedAlerts = filteredAlerts.slice((alertPage - 1) * ALERTS_PER_PAGE, alertPage * ALERTS_PER_PAGE);
-
-  // Correlations Pagination & Filtering
-  const filteredCorrelations = useMemo(() => correlations.filter((corr) => {
-    if (correlationSearchQuery) {
-      const q = correlationSearchQuery.toLowerCase();
-      if (!corr.chain_label.toLowerCase().includes(q)) return false;
-    }
-    return true;
-  }), [correlations, correlationSearchQuery]);
-
-  const totalCorrelationPages = Math.max(1, Math.ceil(filteredCorrelations.length / ALERTS_PER_PAGE));
-  useEffect(() => { if (correlationPage > totalCorrelationPages) setCorrelationPage(1); }, [totalCorrelationPages, correlationPage]);
-  const paginatedCorrelations = filteredCorrelations.slice((correlationPage - 1) * ALERTS_PER_PAGE, correlationPage * ALERTS_PER_PAGE);
-
-  // Sharing & Export Helpers
-  const copyToClipboard = async (text: string) => {
+  // ── Sistem İşlemleri ──
+  const updateSystemSettings = async (settings: SystemSettings) => {
     try {
-      await navigator.clipboard.writeText(text);
-      alert("✅ Rapor panoya başarıyla kopyalandı!");
-    } catch (e) {
-      console.error("Panoya kopyalama başarısız", e);
-    }
+      const resp = await fetch(`${API_URL}/api/system/settings`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(settings),
+      });
+      const data = await resp.json();
+      if (data) setSystemSettings(data);
+    } catch (e) { console.error("updateSystemSettings:", e); }
   };
 
-  const executeExportCSV = () => {
-    let dataToExport = logs;
-    if (exportStartStr) {
-      const startObj = new Date(exportStartStr);
-      dataToExport = dataToExport.filter(l => new Date(l.timestamp) >= startObj);
-    }
-    if (exportEndStr) {
-      const endObj = new Date(exportEndStr);
-      dataToExport = dataToExport.filter(l => new Date(l.timestamp) <= endObj);
-    }
-
-    const csvContent = "data:text/csv;charset=utf-8,"
-      + "Zaman;Seviye;Kaynak;Mesaj\n"
-      + dataToExport.map(l => `${l.timestamp};${l.level};${l.source};"${l.message.replace(/"/g, '""')}"`).join("\n");
-
-    const encodedUri = encodeURI(csvContent);
-    const link = document.createElement("a");
-    link.setAttribute("href", encodedUri);
-    link.setAttribute("download", `logsense_export_${new Date().toISOString().slice(0, 10)}.csv`);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    setShowExportModal(false);
+  const triggerMaintenance = async () => {
+    setIsMaintenanceRunning(true);
+    try {
+      await fetch(`${API_URL}/api/system/maintenance`, { method: "POST" });
+      alert("Bakım görevi başlatıldı! İşlem arka planda yürütülüyor.");
+      setTimeout(fetchBackups, 3000);
+    } catch (e) { console.error("triggerMaintenance:", e); }
+    finally { setIsMaintenanceRunning(false); }
   };
 
-  const setQuickDate = (days: number) => {
-    const end = new Date();
-    const start = new Date();
-    start.setDate(end.getDate() - days);
-
-    const formatForInput = (d: Date) => {
-      return new Date(d.getTime() - (d.getTimezoneOffset() * 60000)).toISOString().slice(0, 16);
-    };
-
-    setExportEndStr(formatForInput(end));
-    setExportStartStr(formatForInput(start));
+  const downloadBackup = (filename: string) => {
+    window.open(`${API_URL}/api/system/backups/${filename}/download`, "_blank");
   };
 
-  const shareAlert = (alert: AlertEntry) => {
-    const text = `🚨 *LogSense Anomali Raporu* 🚨\n*Seviye:* ${alert.level}\n*Kaynak:* ${alert.source}\n*Zaman:* ${fmtTime(alert.timestamp)}\n\n*Mesaj:*\n\`\`\`\n${alert.message}\n\`\`\`\n\n🧠 *AI Kök Neden Analizi:*\n${alert.ai_analysis?.llm_analysis || "Analiz yok."}`;
-    copyToClipboard(text);
+  const deleteBackup = async (filename: string) => {
+    if (!confirm(`${filename} dosyasını kalıcı olarak silmek istediğinize emin misiniz?`)) return;
+    try {
+      await fetch(`${API_URL}/api/system/backups/${filename}`, { method: "DELETE" });
+      fetchBackups();
+    } catch (e) { console.error("deleteBackup:", e); }
   };
 
-  const shareCorrelation = (corr: CorrelationGroup) => {
-    const text = `🔗 *LogSense Korelasyon Raporu* 🔗\n*Zincir ID:* ${corr.group_id}\n*Etiket:* ${corr.chain_label}\n\n*Etki Özeti:*\n${corr.impact_summary || "Bilinmiyor."}\n\n*Bağlı Olaylar (${corr.event_count}):*\n${corr.events.map((e, i) => `${i + 1}. [${e.source}] ${e.message} (${fmtTime(e.timestamp)})`).join('\n')}`;
-    copyToClipboard(text);
-  };
+  const clearAllHistory = useCallback(async () => {
+    try {
+      if (!confirm("Tüm log, anomali ve AI analiz geçmişini silmek istediğinize emin misiniz?")) return;
+      const resp = await fetch(`${API_URL}/api/history/clear-all`, { method: "DELETE" });
+      if (resp.ok) { clearLogs(); setAlerts([]); setCorrelations([]); }
+    } catch (e) { console.error("clearAllHistory:", e); }
+  }, [clearLogs]);
 
-  const chartData = useMemo(() => buildChart(logs), [logs]);
-  const sourceData = useMemo(() => buildSourceData(logs), [logs]);
-  const severityData = useMemo(() => buildSeverityData(logs), [logs]);
-  const httpData = useMemo(() => buildHttpData(logs), [logs]);
-  const riskData = useMemo(() => buildRiskData(logs), [logs]);
-  const topErrorsData = useMemo(() => buildTopErrorsData(logs), [logs]);
-  const anomalyStatusData = useMemo(() => buildAnomalyStatusData(alerts), [alerts]);
-
-  // ──── Persistent Alert Actions ────
+  // ── Alert İşlemleri ──
   const resolveAlert = async (id: number) => {
     try {
-      await fetch(`${API_URL}/api/alerts/${id}/resolve`, {
-        method: "POST",
-        headers: { "X-API-KEY": API_KEY }
-      });
-      setAlerts(prev => prev.filter(a => a.id !== id));
+      await fetch(`${API_URL}/api/alerts/${id}/resolve`, { method: "POST", headers: { "X-API-KEY": API_KEY } });
+      setAlerts((prev) => prev.filter((a) => a.id !== id));
       setSelectedAlert(null);
-    } catch (e) {
-      console.error("Failed to resolve alert:", e);
-    }
+    } catch (e) { console.error("resolveAlert:", e); }
   };
 
   const markFalse = async (id: number) => {
     try {
-      await fetch(`${API_URL}/api/alerts/${id}/false-positive`, {
-        method: "POST",
-        headers: { "X-API-KEY": API_KEY }
-      });
-      setAlerts(prev => prev.filter(a => a.id !== id));
+      await fetch(`${API_URL}/api/alerts/${id}/false-positive`, { method: "POST", headers: { "X-API-KEY": API_KEY } });
+      setAlerts((prev) => prev.filter((a) => a.id !== id));
       setSelectedAlert(null);
-    } catch (e) {
-      console.error("Failed to mark false positive:", e);
-    }
+    } catch (e) { console.error("markFalse:", e); }
   };
 
+  // ── Paylaşım ──
+  const copyToClipboard = async (text: string) => {
+    try { await navigator.clipboard.writeText(text); alert("✅ Rapor panoya başarıyla kopyalandı!"); }
+    catch (e) { console.error("clipboard:", e); }
+  };
+
+  const shareAlert = (alert: AlertEntry) => {
+    const text = `🚨 *LogSense Anomali Raporu* 🚨\n*Seviye:* ${alert.level}\n*Kaynak:* ${alert.source}\n\n*Mesaj:*\n\`\`\`\n${alert.message}\n\`\`\`\n\n🧠 *AI Kök Neden Analizi:*\n${alert.ai_analysis?.llm_analysis || "Analiz yok."}`;
+    copyToClipboard(text);
+  };
+
+  const shareCorrelation = (corr: CorrelationGroup) => {
+    const text = `🔗 *LogSense Korelasyon Raporu* 🔗\n*Zincir ID:* ${corr.group_id}\n*Etiket:* ${corr.chain_label}\n\n*Etki Özeti:*\n${corr.impact_summary || "Bilinmiyor."}\n\n*Bağlı Olaylar (${corr.event_count}):*\n${corr.events.map((e, i) => `${i + 1}. [${e.source}] ${e.message}`).join("\n")}`;
+    copyToClipboard(text);
+  };
+
+  // ── Test Hatası Üret ──
   const triggerError = async () => {
     setSending(true);
     const errors = [
@@ -554,720 +284,221 @@ export default function Dashboard() {
       try {
         await fetch(`${API_URL}/api/logs`, {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "X-API-KEY": API_KEY
-          },
-          body: JSON.stringify({ ...err, timestamp: new Date().toISOString() })
+          headers: { "Content-Type": "application/json", "X-API-KEY": API_KEY },
+          body: JSON.stringify({ ...err, timestamp: new Date().toISOString() }),
         });
-      } catch { }
-      await new Promise(r => setTimeout(r, 500));
+      } catch {}
+      await new Promise((r) => setTimeout(r, 500));
     }
     setSending(false);
   };
 
-  // ──── Filter Bar Component ────
-  const FilterBar = ({ showLevel = true }: { showLevel?: boolean }) => (
-    <div className="filter-bar">
-      <div className="filter-search">
-        <span className="filter-icon">🔎</span>
-        <input type="text" className="filter-input" placeholder="Loglarda ara..." value={searchQuery} onChange={e => setSearchQuery(e.target.value)} />
-        {searchQuery && <button className="filter-clear" onClick={() => setSearchQuery("")}>✕</button>}
-      </div>
-      {showLevel && (
-        <div className="filter-levels">
-          {["ALL", "INFO", "WARN", "ERROR", "CRITICAL"].map(lvl => {
-            const isActive = lvl === "ALL" ? levelFilter === null : levelFilter === lvl;
-            return (
-              <button key={lvl} className={`level-btn ${lvl} ${isActive ? "active" : ""}`}
-                onClick={() => setLevelFilter(lvl === "ALL" ? null : (levelFilter === lvl ? null : lvl))}>{lvl}</button>
-            );
-          })}
-        </div>
-      )}
-      <select className="filter-select" value={sourceFilter} onChange={e => setSourceFilter(e.target.value)}>
-        <option value="all">Tüm Kaynaklar</option>
-        {uniqueSources.map(s => <option key={s} value={s}>{s}</option>)}
-      </select>
-      <select className="filter-select" value={timeRange} onChange={e => setTimeRange(Number(e.target.value))}>
-        <option value={0}>Tüm Zamanlar</option>
-        <option value={1}>Son 1 dk</option>
-        <option value={5}>Son 5 dk</option>
-        <option value={15}>Son 15 dk</option>
-        <option value={60}>Son 1 saat</option>
-      </select>
-    </div>
+  // ── Hesaplanan (Memoized) Değerler ──
+  const uniqueSources = useMemo(
+    () => Array.from(new Set(logs.map((l) => l.source))).sort(),
+    [logs]
   );
 
+  const filteredLogs = useMemo(
+    () =>
+      logs.filter((log) => {
+        if (levelFilter && log.level !== levelFilter) return false;
+        if (sourceFilter !== "all" && log.source !== sourceFilter) return false;
+        if (searchQuery) {
+          const q = searchQuery.toLowerCase();
+          if (!log.message.toLowerCase().includes(q) && !log.source.toLowerCase().includes(q)) return false;
+        }
+        if (timeRange > 0 && minsAgo(log.timestamp) > timeRange) return false;
+        return true;
+      }),
+    [logs, levelFilter, sourceFilter, searchQuery, timeRange]
+  );
+
+  const totalLogPages = Math.max(1, Math.ceil(filteredLogs.length / LOGS_PER_PAGE));
+  useEffect(() => { if (logPage > totalLogPages) setLogPage(1); }, [totalLogPages, logPage]);
+  const paginatedLogs = filteredLogs.slice((logPage - 1) * LOGS_PER_PAGE, logPage * LOGS_PER_PAGE);
+
+  const filteredAlerts = useMemo(
+    () =>
+      alerts.filter((alert) => {
+        if (sourceFilter !== "all" && alert.source !== sourceFilter) return false;
+        if (searchQuery && !alert.message.toLowerCase().includes(searchQuery.toLowerCase())) return false;
+        return true;
+      }),
+    [alerts, sourceFilter, searchQuery]
+  );
+
+  const totalAlertPages = Math.max(1, Math.ceil(filteredAlerts.length / ALERTS_PER_PAGE));
+  useEffect(() => { if (alertPage > totalAlertPages) setAlertPage(1); }, [totalAlertPages, alertPage]);
+  const paginatedAlerts = filteredAlerts.slice((alertPage - 1) * ALERTS_PER_PAGE, alertPage * ALERTS_PER_PAGE);
+
+  const filteredCorrelations = useMemo(
+    () =>
+      correlations.filter((corr) =>
+        correlationSearchQuery
+          ? corr.chain_label.toLowerCase().includes(correlationSearchQuery.toLowerCase())
+          : true
+      ),
+    [correlations, correlationSearchQuery]
+  );
+
+  const totalCorrelationPages = Math.max(1, Math.ceil(filteredCorrelations.length / ALERTS_PER_PAGE));
+  useEffect(() => { if (correlationPage > totalCorrelationPages) setCorrelationPage(1); }, [totalCorrelationPages, correlationPage]);
+  const paginatedCorrelations = filteredCorrelations.slice((correlationPage - 1) * ALERTS_PER_PAGE, correlationPage * ALERTS_PER_PAGE);
+
+  const stats = useMemo(() => ({
+    total: logs.length,
+    info: logs.filter((l) => l.level === "INFO").length,
+    warn: logs.filter((l) => l.level === "WARN").length,
+    error: logs.filter((l) => l.level === "ERROR" || l.level === "CRITICAL").length,
+    anomalies: alerts.length,
+  }), [logs, alerts]);
+
+  const chartData = useMemo(() => buildChart(logs), [logs]);
+  const severityData = useMemo(() => buildSeverityData(logs), [logs]);
+  const httpData = useMemo(() => buildHttpData(logs), [logs]);
+  const riskData = useMemo(() => buildRiskData(logs), [logs]);
+  const topErrorsData = useMemo(() => buildTopErrorsData(logs), [logs]);
+
+  // ── Paylaşılan Filtre Props'ları ──
+  const filterProps = {
+    searchQuery,
+    setSearchQuery,
+    levelFilter,
+    setLevelFilter,
+    sourceFilter,
+    setSourceFilter,
+    timeRange,
+    setTimeRange,
+    uniqueSources,
+  };
+
+  // ──────────────────────────────────────────────
+  // Render
+  // ──────────────────────────────────────────────
   return (
     <div className="app-container">
-      {/* ── Sidebar ── */}
-      <aside className="sidebar">
-        <div className="sidebar-header">
-          <div className="sidebar-logo">🔍</div>
-          <div>
-            <h1 className="sidebar-title">LogSense AI</h1>
-            <p className="sidebar-version">v2.2 — Managed</p>
-          </div>
-        </div>
+      <Sidebar
+        activeTab={activeTab}
+        setActiveTab={setActiveTab}
+        theme={theme}
+        setTheme={setTheme}
+        connected={connected}
+        sending={sending}
+        onTriggerError={triggerError}
+        onOpenSystemModal={() => setShowSystemModal(true)}
+        anomalyCount={stats.anomalies}
+        correlationCount={correlations.length}
+      />
 
-        <nav className="sidebar-nav">
-          <button className={`nav-item ${activeTab === 'overview' ? 'active' : ''}`} onClick={() => setActiveTab('overview')}>
-            <span className="nav-icon">📊</span> Genel Bakış
-          </button>
-          <button className={`nav-item ${activeTab === 'logs' ? 'active' : ''}`} onClick={() => setActiveTab('logs')}>
-            <span className="nav-icon">📜</span> Canlı Akış
-          </button>
-          <button className={`nav-item ${activeTab === 'ai' ? 'active' : ''}`} onClick={() => setActiveTab('ai')}>
-            <span className="nav-icon">🧠</span> AI Analiz
-            {stats.anomalies > 0 && <span className="nav-badge">{stats.anomalies}</span>}
-          </button>
-          <button className={`nav-item ${activeTab === 'correlations' ? 'active' : ''}`} onClick={() => setActiveTab('correlations')}>
-            <span className="nav-icon">🔗</span> Korelasyonlar
-            {correlations.length > 0 && <span className="nav-badge" style={{ background: 'var(--accent-cyan)' }}>{correlations.length}</span>}
-          </button>
-          <div className="sidebar-divider"></div>
-          <button className="nav-item system-btn" onClick={() => setShowSystemModal(true)}>
-            <span className="nav-icon">⚙️</span> Sistem Ayarları
-          </button>
-        </nav>
-
-        <div className="sidebar-footer">
-          <div className="status-indicator">
-            <div className={`status-dot ${connected ? "" : "disconnected"}`}></div>
-            <span>{connected ? "Bağlı" : "Bağlantı Yok"}</span>
-          </div>
-          <button className="error-trigger-btn" onClick={triggerError} disabled={sending}>
-            {sending ? "⏳ Gönderiliyor..." : "💥 Test Hatası Üret"}
-          </button>
-          <button className="theme-toggle-btn" onClick={() => setTheme(prev => prev === "dark" ? "light" : "dark")}>
-            {theme === "dark" ? "☀️ Aydınlık Mod" : "🌙 Karanlık Mod"}
-          </button>
-        </div>
-      </aside>
-
-      {/* ── Main ── */}
       <div className="main-layout">
-        <header className="top-header">
-          <div className="header-page-title">
-            {activeTab === 'overview' && "Sistem Genel Bakış"}
-            {activeTab === 'logs' && "Gerçek Zamanlı Log Akışı"}
-            {activeTab === 'ai' && "AI Anomali Zekası"}
-            {activeTab === 'correlations' && "Olay Korelasyonları"}
-          </div>
-          <div className="header-stats-row">
-            <div className="h-stat total"><span className="h-stat-n">{stats.total}</span> log</div>
-            <div className="h-stat info"><span className="h-stat-n">{stats.info}</span> veri</div>
-            <div className="h-stat warn"><span className="h-stat-n">{stats.warn}</span> uyarı</div>
-            <div className="h-stat error"><span className="h-stat-n">{stats.error}</span> hata</div>
-            <div className="h-stat anomaly"><span className="h-stat-n">{stats.anomalies}</span> anomali</div>
-            <div className="header-sync-badge">
-              <span className="sync-dot"></span>
-              {new Date().toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
-            </div>
-          </div>
-        </header>
+        <Header activeTab={activeTab} stats={stats} />
 
         <main className="content-area">
-
-          {/* ═══════ TAB: OVERVIEW (PRO COMMAND CENTER) ═══════ */}
-          {activeTab === 'overview' && (
-            <div className="tab-pane fade-in">
-              <div className="stats-grid">
-                <div className="stat-box blue"><div className="stat-icon-wrap">📊</div><div className="stat-data"><span className="stat-num">{stats.total}</span><span className="stat-lbl">Toplam Log</span></div></div>
-                <div className="stat-box cyan"><div className="stat-icon-wrap">ℹ️</div><div className="stat-data"><span className="stat-num">{stats.info}</span><span className="stat-lbl">Bilgi Akışı</span></div></div>
-                <div className="stat-box yellow"><div className="stat-icon-wrap">⚠️</div><div className="stat-data"><span className="stat-num">{stats.warn}</span><span className="stat-lbl">Uyarılar</span></div></div>
-                <div className="stat-box red"><div className="stat-icon-wrap">🔴</div><div className="stat-data"><span className="stat-num">{stats.error}</span><span className="stat-lbl">Hatalar</span></div></div>
-              </div>
-
-              {/* TIER 1: Traffic & Intelligence */}
-              <div className="charts-row">
-                <div className="chart-card-v2">
-                  <div className="chart-title-v2">📈 Gerçek Zamanlı Trafik Hacmi <span className="badge-live-sm">CANLI</span></div>
-                  <ResponsiveContainer width="100%" height={240}>
-                    <AreaChart data={chartData}>
-                      <defs>
-                        <linearGradient id="gI" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor="#3b82f6" stopOpacity={0.4} /><stop offset="95%" stopColor="#3b82f6" stopOpacity={0} /></linearGradient>
-                      </defs>
-                      <CartesianGrid stroke="#1e293b" strokeDasharray="3 3" vertical={false} /><XAxis dataKey="time" stroke="#475569" fontSize={10} /><YAxis stroke="#475569" fontSize={10} />
-                      <Tooltip
-                        contentStyle={{ background: "var(--bg-card)", border: "1px solid var(--border-hover)", borderRadius: 8, fontSize: 12 }}
-                        itemStyle={{ color: "var(--text-primary)" }}
-                        labelStyle={{ color: "var(--text-secondary)" }}
-                      />
-                      <Area type="monotone" dataKey="info" stroke="#3b82f6" fill="url(#gI)" strokeWidth={2} name="Bilgi" />
-                      <Area type="monotone" dataKey="warn" stroke="#f59e0b" fill="transparent" strokeWidth={2} name="Uyarı" />
-                      <Area type="monotone" dataKey="error" stroke="#ef4444" fill="transparent" strokeWidth={2} name="Hata" />
-                    </AreaChart>
-                  </ResponsiveContainer>
-                </div>
-                <div className="chart-card-v2">
-                  <div className="chart-title-v2">🧠 AI Anomali Zekası <span className="badge-trend-sm">GPT-4o</span></div>
-                  <ResponsiveContainer width="100%" height={240}>
-                    <LineChart data={chartData}>
-                      <CartesianGrid stroke="#1e293b" strokeDasharray="3 3" vertical={false} /><XAxis dataKey="time" stroke="#475569" fontSize={10} /><YAxis stroke="#475569" fontSize={10} domain={[0, 1]} />
-                      <Tooltip contentStyle={{ background: "var(--bg-card)", border: "1px solid #c084fc", borderRadius: 8, fontSize: 12 }} itemStyle={{ color: "var(--text-primary)" }} labelStyle={{ color: "var(--text-secondary)" }} formatter={(v: any) => [(Number(v) * 100).toFixed(0) + "%", "Olasılık"]} />
-                      <ReferenceLine y={0.5} stroke="#ef4444" strokeDasharray="5 5" label={{ value: "Alarm Eşiği", fill: "#ef4444", fontSize: 10, position: 'right' }} />
-                      <Line type="monotone" dataKey="maxScore" stroke="#c084fc" strokeWidth={3} dot={false} activeDot={{ r: 5 }} />
-                    </LineChart>
-                  </ResponsiveContainer>
-                </div>
-              </div>
-
-              {/* TIER 2: Specialized Diagnostics */}
-              <div className="charts-row triple">
-                <div className="chart-card-v2">
-                  <div className="chart-title-v2">❤️ Sistem Sağlık Oranı</div>
-                  <ResponsiveContainer width="100%" height={200}>
-                    <PieChart>
-                      <Pie data={severityData} innerRadius={55} outerRadius={75} paddingAngle={5} dataKey="value" stroke="none">
-                        {severityData.map((entry, index) => <Cell key={`c-${index}`} fill={entry.color} />)}
-                      </Pie>
-                      <Tooltip contentStyle={{ background: "var(--bg-card)", border: "1px solid var(--border-hover)", borderRadius: 8, fontSize: 11 }} itemStyle={{ color: "var(--text-primary)" }} />
-                      <Legend verticalAlign="bottom" height={36} iconType="circle" wrapperStyle={{ fontSize: 10 }} />
-                    </PieChart>
-                  </ResponsiveContainer>
-                </div>
-                <div className="chart-card-v2">
-                  <div className="chart-title-v2">🌐 HTTP Durum Kodları</div>
-                  <ResponsiveContainer width="100%" height={200}>
-                    <BarChart data={httpData}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} />
-                      <XAxis dataKey="name" stroke="#475569" fontSize={10} />
-                      <YAxis stroke="#475569" fontSize={10} />
-                      <Tooltip contentStyle={{ background: "var(--bg-card)", border: "1px solid var(--border-hover)", borderRadius: 8, fontSize: 11 }} itemStyle={{ color: "var(--text-primary)" }} />
-                      <Bar dataKey="value" fill="#22d3ee" barSize={24} radius={[4, 4, 0, 0]} />
-                    </BarChart>
-                  </ResponsiveContainer>
-                </div>
-                <div className="chart-card-v2">
-                  <div className="chart-title-v2">🛡️ IP Güvenlik Risk Profilleme</div>
-                  <ResponsiveContainer width="100%" height={200}>
-                    <PieChart>
-                      <Pie data={riskData} dataKey="value" nameKey="name" outerRadius={70} stroke="none">
-                        {riskData.map((entry, index) => (
-                          <Cell key={`r-${index}`} fill={entry.name === 'High' ? '#ef4444' : entry.name === 'Medium' ? '#f59e0b' : '#22c55e'} />
-                        ))}
-                      </Pie>
-                      <Tooltip contentStyle={{ background: "var(--bg-card)", border: "1px solid var(--border-hover)", borderRadius: 8, fontSize: 11 }} itemStyle={{ color: "var(--text-primary)" }} />
-                      <Legend verticalAlign="bottom" height={36} iconType="circle" wrapperStyle={{ fontSize: 10 }} />
-                    </PieChart>
-                  </ResponsiveContainer>
-                </div>
-              </div>
-
-              {/* TIER 3: Operational Incident Patterns */}
-              <div className="charts-row single">
-                <div className="chart-card-v2">
-                  <div className="chart-title-v2">🚨 En Sık Karşılaşılan Hata Desenleri (Kök Neden Analizi)</div>
-                  <ResponsiveContainer width="100%" height={220}>
-                    <BarChart data={topErrorsData} layout="vertical" margin={{ left: 30, right: 30 }}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" horizontal={true} vertical={false} />
-                      <XAxis type="number" hide />
-                      <YAxis dataKey="name" type="category" stroke="#94a3b8" fontSize={9} width={180} />
-                      <Tooltip
-                        cursor={{ fill: 'rgba(255,255,255,0.03)' }}
-                        contentStyle={{ background: "var(--bg-card)", border: "1px solid #ef4444", borderRadius: 8, fontSize: 11 }}
-                        itemStyle={{ color: "var(--text-primary)" }}
-                        labelStyle={{ color: "var(--text-secondary)", fontSize: 9 }}
-                      />
-                      <Bar dataKey="value" fill="#ef4444" barSize={14} radius={[0, 4, 4, 0]} />
-                    </BarChart>
-                  </ResponsiveContainer>
-                </div>
-              </div>
-            </div>
+          {activeTab === "overview" && (
+            <OverviewTab
+              stats={stats}
+              chartData={chartData}
+              severityData={severityData}
+              httpData={httpData}
+              riskData={riskData}
+              topErrorsData={topErrorsData}
+            />
           )}
 
-          {/* ═══════ TAB: LIVE STREAM ═══════ */}
-          {activeTab === 'logs' && (
-            <div className="tab-pane fade-in">
-              <FilterBar showLevel={true} />
-              <div className="terminal-container-v2">
-                <div className="terminal-header-v2">
-                  <div className="terminal-dots"><span className="dot r"></span><span className="dot y"></span><span className="dot g"></span></div>
-                  <span className="terminal-uri">logsense://canli-akis — {filteredLogs.length} kayıt</span>
-                  <div className="terminal-controls">
-                    <button className="term-btn export-btn" onClick={() => setShowExportModal(true)} title="CSV olarak dışa aktar">📥 Export CSV</button>
-                    <span className="badge-live">● CANLI</span>
-                    <button className="term-btn" onClick={clearAllHistory} title="Tüm geçmişi sil">🗑️ Temizle</button>
-                  </div>
-                </div>
-                <div className="terminal-body-v2">
-                  {paginatedLogs.length === 0 ? (
-                    <div className="terminal-empty"><span className="empty-icon">📡</span><p>Log akışı bekleniyor...</p><code>python producer.py</code></div>
-                  ) : paginatedLogs.map((log, i) => (
-                    <div key={log.id || i} className={`log-line-v2 ${log.level}`} onClick={() => setSelectedLog(log)}>
-                      <span className="ll-time">{fmtTime(log.timestamp)}</span>
-                      <span className={`ll-level ${log.level}`}>{log.level}</span>
-                      <span className="ll-source">{log.source}</span>
-                      {log.ai_analysis && (
-                        <>
-                          <span className="ll-model">{log.ai_analysis.model_used}</span>
-                          <span className={`ll-badge ${log.ai_analysis.ml_prediction}`}>
-                            {log.ai_analysis.ml_prediction === "anomaly" ? "⚠ ANOMALY" : "✓"}
-                          </span>
-                        </>
-                      )}
-                      <span className="ll-msg">{log.message}</span>
-                    </div>
-                  ))}
-                </div>
-                {totalLogPages > 1 && (
-                  <div className="pagination-bar">
-                    <button className="page-btn" disabled={logPage <= 1} onClick={() => setLogPage(1)}>⏮</button>
-                    <button className="page-btn" disabled={logPage <= 1} onClick={() => setLogPage(p => p - 1)}>◀</button>
-                    <span className="page-info">{logPage} / {totalLogPages}</span>
-                    <button className="page-btn" disabled={logPage >= totalLogPages} onClick={() => setLogPage(p => p + 1)}>▶</button>
-                    <button className="page-btn" disabled={logPage >= totalLogPages} onClick={() => setLogPage(totalLogPages)}>⏭</button>
-                    <span className="page-hint">{filteredLogs.length} kayıt</span>
-                  </div>
-                )}
-              </div>
-            </div>
+          {activeTab === "logs" && (
+            <LiveStreamTab
+              paginatedLogs={paginatedLogs}
+              filteredLogs={filteredLogs}
+              logPage={logPage}
+              totalLogPages={totalLogPages}
+              setLogPage={setLogPage}
+              onSelectLog={setSelectedLog}
+              onClearHistory={clearAllHistory}
+              onExport={() => setShowExportModal(true)}
+              {...filterProps}
+            />
           )}
 
-          {/* ═══════ TAB: AI INSIGHTS ═══════ */}
-          {activeTab === 'ai' && (
-            <div className="tab-pane fade-in">
-              {/* Archive Toggle Header */}
-              <div className="ai-archive-header">
-                <div className="ai-view-toggle">
-                  <button
-                    className={`ai-view-btn ${alertView === 'active' ? 'active' : ''}`}
-                    onClick={() => setAlertView('active')}
-                  >
-                    🔴 Aktif Anomaliler
-                    {alertView === 'active' && alerts.length > 0 && <span className="ai-view-count">{alerts.length}</span>}
-                  </button>
-                  <button
-                    className={`ai-view-btn ${alertView === 'resolved' ? 'active resolved' : ''}`}
-                    onClick={() => setAlertView('resolved')}
-                  >
-                    ✅ Çözülenler Arşivi
-                  </button>
-                  <button
-                    className={`ai-view-btn ${alertView === 'false_positive' ? 'active false-pos' : ''}`}
-                    onClick={() => setAlertView('false_positive')}
-                  >
-                    🚫 Hatalı Alarmlar
-                  </button>
-                </div>
-                <FilterBar showLevel={false} />
-              </div>
-
-              {/* Dense Grid Layout */}
-              <div className="ai-grid-dense">
-                {paginatedAlerts.length === 0 ? (
-                  <div className="ai-empty-full">
-                    <span className="ai-empty-icon">
-                      {alertView === 'active' ? '🧠' : alertView === 'resolved' ? '✅' : '🚫'}
-                    </span>
-                    <h3>
-                      {alertView === 'active' ? 'Sistem Temiz' : alertView === 'resolved' ? 'Çözülen Alarm Yok' : 'Hatalı Alarm Kaydı Yok'}
-                    </h3>
-                    <p>
-                      {alertView === 'active'
-                        ? 'Anomali tespit edilmedi. AI motoru altyapınızı sürekli tarıyor.'
-                        : alertView === 'resolved'
-                          ? 'Henüz çözülen bir anomali kaydı bulunmuyor.'
-                          : 'Hatalı alarm olarak işaretlenmiş kayıt yok.'}
-                    </p>
-                  </div>
-                ) : paginatedAlerts.map((alert) => (
-                  <div key={alert.id} className={`ai-card-compact ${alert.level} ${alert.is_resolved ? 'resolved' : ''} ${alert.is_false_positive ? 'false-pos' : ''}`} onClick={() => setSelectedAlert(alert)}>
-                    {/* Status ribbon */}
-                    {alert.is_resolved && <div className="ai-card-ribbon resolved">✅ Çözüldü</div>}
-                    {alert.is_false_positive && <div className="ai-card-ribbon false-pos">🚫 Hatalı</div>}
-
-                    <div className="ai-card-compact-top">
-                      <span className={`ai-level-tag ${alert.level}`}>{alert.level === "CRITICAL" ? "💀" : alert.level === "ERROR" ? "🔴" : "⚠️"} {alert.level}</span>
-                      <span className="ai-card-source-badge">{alert.source}</span>
-                      {alert.ai_analysis && alert.ai_analysis.anomaly_score !== undefined && (
-                        <div className="ai-risk-badge" style={{ background: alert.ai_analysis.anomaly_score > 0.7 ? 'rgba(239, 68, 68, 0.2)' : 'rgba(245, 158, 11, 0.2)', color: alert.ai_analysis.anomaly_score > 0.7 ? '#fca5a5' : '#fcd34d' }}>
-                          %{(alert.ai_analysis.anomaly_score * 100).toFixed(0)} RİSK
-                        </div>
-                      )}
-                      <span className="ai-card-time-sm">{fmtTime(alert.timestamp)}</span>
-                    </div>
-
-                    <div className="ai-card-compact-msg">{alert.message}</div>
-
-                    {alert.ai_analysis?.llm_analysis && (
-                      <div className="ai-card-llm-preview">
-                        🧠 {alert.ai_analysis.llm_analysis.substring(0, 120)}{alert.ai_analysis.llm_analysis.length > 120 ? '...' : ''}
-                      </div>
-                    )}
-
-                    {alert.ai_analysis?.anomaly_score !== undefined && (
-                      <div className="ai-card-score-bar">
-                        <div className="score-bar-fill" style={{ width: `${alert.ai_analysis.anomaly_score * 100}%`, background: alert.ai_analysis.anomaly_score > 0.7 ? '#ef4444' : alert.ai_analysis.anomaly_score > 0.4 ? '#f59e0b' : '#22c55e' }} />
-                        <span className="score-bar-label">{(alert.ai_analysis.anomaly_score * 100).toFixed(0)}% Risk</span>
-                      </div>
-                    )}
-
-                    {alertView === 'active' && (
-                      <div className="ai-card-compact-actions">
-                        <button className="action-btn-sm resolve" onClick={e => { e.stopPropagation(); resolveAlert(alert.id); }}>✅ Çözüldü</button>
-                        <button className="action-btn-sm false-pos" onClick={e => { e.stopPropagation(); markFalse(alert.id); }}>🚫 Hatalı</button>
-                      </div>
-                    )}
-                  </div>
-                ))}
-              </div>
-
-              {totalAlertPages > 1 && (
-                <div className="pagination-bar" style={{ marginTop: 16 }}>
-                  <button className="page-btn" onClick={() => setAlertPage(p => Math.max(1, p - 1))}>◀</button>
-                  <span className="page-info">{alertPage} / {totalAlertPages}</span>
-                  <button className="page-btn" onClick={() => setAlertPage(p => Math.min(totalAlertPages, p + 1))}>▶</button>
-                </div>
-              )}
-            </div>
+          {activeTab === "ai" && (
+            <AIAnalysisTab
+              alertView={alertView}
+              setAlertView={setAlertView}
+              paginatedAlerts={paginatedAlerts}
+              filteredAlerts={filteredAlerts}
+              alertPage={alertPage}
+              totalAlertPages={totalAlertPages}
+              setAlertPage={setAlertPage}
+              onSelectAlert={setSelectedAlert}
+              onResolve={resolveAlert}
+              onMarkFalse={markFalse}
+              searchQuery={searchQuery}
+              setSearchQuery={setSearchQuery}
+              sourceFilter={sourceFilter}
+              setSourceFilter={setSourceFilter}
+              uniqueSources={uniqueSources}
+            />
           )}
 
-          {/* ═══════ TAB: CORRELATIONS ═══════ */}
-          {activeTab === 'correlations' && (
-            <div className="tab-pane fade-in">
-              {filteredCorrelations.length === 0 ? (
-                <div className="ai-empty-full">
-                  <span className="ai-empty-icon">🔗</span>
-                  <h3>Korelasyon Tespit Edilmedi</h3>
-                  <p>Şu anda olaylar arasında herhangi bir nedensellik veya tetikleme zinciri bulunmuyor.</p>
-                </div>
-              ) : (
-                <div className="corr-trace-container fade-in">
-                  <div className="corr-trace-header">
-                    <div className="corr-trace-title">Nedensellik & Zincirleme Hata Analizi</div>
-                    <div className="corr-trace-subtitle">Sistem, farklı kaynaklardan gelen logları zaman ve içerik bazlı otomatik bağlar.</div>
-                    <div className="filter-search" style={{ marginTop: 12, maxWidth: 300 }}>
-                      <span className="filter-icon">🔎</span>
-                      <input type="text" className="filter-input" placeholder="Zincirlerde ara..." value={correlationSearchQuery} onChange={e => setCorrelationSearchQuery(e.target.value)} />
-                    </div>
-                  </div>
-
-                  <div className="corr-trace-list">
-                    {paginatedCorrelations.map(corr => (
-                      <div key={corr.group_id} className="corr-trace-item" onClick={() => setSelectedCorrelation(corr)}>
-                        <div className="corr-trace-left">
-                          <div className="corr-trace-line"></div>
-                          <div className="corr-trace-node"></div>
-                        </div>
-                        <div className="corr-trace-content">
-                          <div className="corr-trace-meta">
-                            <span className="corr-trace-id">Zincir #{corr.group_id.split('-')[0]}</span>
-                            <span className="corr-trace-count">{corr.event_count} Bağlı Olay</span>
-                          </div>
-                          <div className="corr-trace-label">{corr.chain_label}</div>
-                          {corr.impact_summary && (
-                            <div className="corr-trace-impact">{corr.impact_summary}</div>
-                          )}
-                        </div>
-                        <div className="corr-trace-action">
-                          <button className="corr-view-btn">Detay İncele ➔</button>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                  {totalCorrelationPages > 1 && (
-                    <div className="pagination-bar" style={{ marginTop: 16 }}>
-                      <button className="page-btn" onClick={() => setCorrelationPage(p => Math.max(1, p - 1))}>◀</button>
-                      <span className="page-info">{correlationPage} / {totalCorrelationPages}</span>
-                      <button className="page-btn" onClick={() => setCorrelationPage(p => Math.min(totalCorrelationPages, p + 1))}>▶</button>
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
+          {activeTab === "correlations" && (
+            <CorrelationsTab
+              filteredCorrelations={filteredCorrelations}
+              paginatedCorrelations={paginatedCorrelations}
+              correlationPage={correlationPage}
+              totalCorrelationPages={totalCorrelationPages}
+              setCorrelationPage={setCorrelationPage}
+              correlationSearchQuery={correlationSearchQuery}
+              setCorrelationSearchQuery={setCorrelationSearchQuery}
+              onSelectCorrelation={setSelectedCorrelation}
+            />
           )}
         </main>
       </div>
 
-      {/* ═══════ MODAL: Export CSV ═══════ */}
+      {/* Modallar */}
       {showExportModal && (
-        <div className="modal-overlay" onClick={() => setShowExportModal(false)}>
-          <div className="modal-content alert-modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 400 }}>
-            <div className="modal-header">
-              <span className="modal-title">📥 Gelişmiş CSV Dışa Aktarım</span>
-              <button className="modal-close" onClick={() => setShowExportModal(false)}>✕</button>
-            </div>
-            <div className="modal-body">
-              <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', marginBottom: 12 }}>
-                Dışa aktarmak istediğiniz kayıtların tarih aralığını belirleyin. (Boş bırakırsanız mevcut tüm kayıtlar aktarılır. Veriler Excel uyumlu sütun ayracı ile indirilecektir.)
-              </p>
-              <div style={{ display: 'flex', gap: 6, marginBottom: 16 }}>
-                <button className="level-btn" style={{ flex: 1, padding: '4px', fontSize: '0.75rem' }} onClick={(e) => { e.preventDefault(); setQuickDate(1); }}>Günlük</button>
-                <button className="level-btn" style={{ flex: 1, padding: '4px', fontSize: '0.75rem' }} onClick={(e) => { e.preventDefault(); setQuickDate(7); }}>Haftalık</button>
-                <button className="level-btn" style={{ flex: 1, padding: '4px', fontSize: '0.75rem' }} onClick={(e) => { e.preventDefault(); setQuickDate(30); }}>Aylık</button>
-              </div>
-              <div className="modal-field" style={{ flexDirection: 'column', alignItems: 'flex-start' }}>
-                <span className="modal-label" style={{ marginBottom: 4 }}>Başlangıç Tarihi</span>
-                <input type="datetime-local" className="filter-input" style={{ width: '100%', fontSize: '0.9rem' }} value={exportStartStr} onChange={e => setExportStartStr(e.target.value)} />
-              </div>
-              <div className="modal-field" style={{ flexDirection: 'column', alignItems: 'flex-start', marginTop: 12 }}>
-                <span className="modal-label" style={{ marginBottom: 4 }}>Bitiş Tarihi</span>
-                <input type="datetime-local" className="filter-input" style={{ width: '100%', fontSize: '0.9rem' }} value={exportEndStr} onChange={e => setExportEndStr(e.target.value)} />
-              </div>
-              <div className="modal-divider" style={{ marginTop: 24 }}></div>
-              <button className="alert-popup-action-btn export" style={{ width: '100%' }} onClick={executeExportCSV}>✅ CSV İndir</button>
-            </div>
-          </div>
-        </div>
+        <ExportModal logs={logs} onClose={() => setShowExportModal(false)} />
       )}
 
-      {/* ═══════ MODAL: Log Detail ═══════ */}
       {selectedLog && (
-        <div className="modal-overlay" onClick={() => setSelectedLog(null)}>
-          <div className="modal-content" onClick={e => e.stopPropagation()}>
-            <div className="modal-header">
-              <span className="modal-title">📋 Log Detayı</span>
-              <button className="modal-close" onClick={() => setSelectedLog(null)}>✕</button>
-            </div>
-            <div className="modal-body">
-              <div className="modal-field"><span className="modal-label">ID</span><span className="modal-value">{selectedLog.id || "Pending"}</span></div>
-              <div className="modal-field"><span className="modal-label">Zaman</span><span className="modal-value">{selectedLog.timestamp}</span></div>
-              <div className="modal-field"><span className="modal-label">Seviye</span><span className={`log-level-badge ${selectedLog.level}`}>{selectedLog.level}</span></div>
-              <div className="modal-field"><span className="modal-label">Kaynak</span><span className="modal-value">{selectedLog.source}</span></div>
-              <div className="modal-field"><span className="modal-label">Mesaj</span><span className="modal-value message-full">{selectedLog.message}</span></div>
-
-              {selectedLog.enrichment && (
-                <>
-                  <div className="modal-divider"></div>
-                  {selectedLog.enrichment.tags && (
-                    <div className="modal-field"><span className="modal-label">Etiketler</span><span className="modal-value" style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-                      {selectedLog.enrichment.tags.map(t => <span key={t} style={{ fontSize: '0.65rem', background: 'var(--bg-terminal)', padding: '2px 8px', borderRadius: 12, border: '1px solid var(--border-primary)' }}>{t}</span>)}
-                    </span></div>
-                  )}
-                  {selectedLog.enrichment.ip_info && (
-                    <div className="modal-field"><span className="modal-label">IP Geo</span><span className="modal-value" style={{ color: 'var(--accent-blue)' }}>
-                      {selectedLog.enrichment.ip_info.ip} — {selectedLog.enrichment.ip_info.city}, {selectedLog.enrichment.ip_info.country} ({selectedLog.enrichment.ip_info.risk_level} risk)
-                    </span></div>
-                  )}
-                  {selectedLog.enrichment.http_info && (
-                    <div className="modal-field"><span className="modal-label">HTTP</span><span className="modal-value">
-                      <span style={{ fontWeight: 700, color: selectedLog.enrichment.http_info.severity === 'info' ? 'var(--accent-green)' : selectedLog.enrichment.http_info.severity === 'warning' ? 'var(--accent-yellow)' : 'var(--accent-red)' }}>{selectedLog.enrichment.http_info.code}</span> — {selectedLog.enrichment.http_info.type}: {selectedLog.enrichment.http_info.desc}
-                    </span></div>
-                  )}
-                </>
-              )}
-
-              {selectedLog.ai_analysis && (
-                <>
-                  <div className="modal-divider"></div>
-                  <div className="modal-field"><span className="modal-label">Tahmin</span><span className={`log-anomaly-badge ${selectedLog.ai_analysis.ml_prediction}`}>{selectedLog.ai_analysis.ml_prediction === "anomaly" ? "⚠ ANOMALİ" : "✓ Normal"}</span></div>
-                  <div className="modal-field"><span className="modal-label">Skor</span><span className="modal-value">{(selectedLog.ai_analysis.anomaly_score * 100).toFixed(1)}%</span></div>
-                  {selectedLog.ai_analysis.llm_analysis && (
-                    <div className="modal-llm"><div className="llm-comment-header">🧠 AI Analizi (GPT-4o)</div>{selectedLog.ai_analysis.llm_analysis}</div>
-                  )}
-                </>
-              )}
-            </div>
-          </div>
-        </div>
+        <LogDetailModal log={selectedLog} onClose={() => setSelectedLog(null)} />
       )}
 
-      {/* ═══════ MODAL: Anomaly Deep Dive ═══════ */}
       {selectedAlert && (
-        <div className="modal-overlay" onClick={() => setSelectedAlert(null)}>
-          <div className="modal-content alert-modal" onClick={e => e.stopPropagation()}>
-            <div className="modal-header alert-modal-header">
-              <span className="modal-title">{selectedAlert.level === "CRITICAL" ? "💀" : "🔴"} Anomali Derin Analizi</span>
-              <button className="modal-close" onClick={() => setSelectedAlert(null)}>✕</button>
-            </div>
-            <div className="modal-body">
-              <div className="alert-popup-top">
-                <div className="alert-popup-level-badge" data-level={selectedAlert.level}>{selectedAlert.level}</div>
-                <div className="alert-popup-source">{selectedAlert.source}</div>
-                <div className="alert-popup-time">{fmtTime(selectedAlert.timestamp)}</div>
-              </div>
-              <div className="alert-popup-message">{selectedAlert.message}</div>
-
-              {selectedAlert.ai_analysis && (
-                <>
-                  <div className="modal-divider"></div>
-                  <div className="modal-field">
-                    <span className="modal-label">Anomali Skoru</span>
-                    <span className="modal-value" style={{ color: 'var(--accent-red)', fontWeight: 'bold' }}>
-                      {(selectedAlert.ai_analysis.anomaly_score * 100).toFixed(1)}%
-                    </span>
-                  </div>
-                  {selectedAlert.ai_analysis.llm_analysis && (
-                    <div className="modal-llm" style={{ marginTop: 12 }}>
-                      <div className="llm-comment-header">🧠 AI Kök Neden & Çözüm Analizi</div>
-                      <div style={{ whiteSpace: 'pre-wrap', fontSize: '0.85rem', lineHeight: '1.6', color: 'var(--text-secondary)' }}>
-                        {selectedAlert.ai_analysis.llm_analysis}
-                      </div>
-                    </div>
-                  )}
-                </>
-              )}
-
-              <div className="modal-divider"></div>
-              <div className="alert-popup-actions">
-                {alertView === 'active' && (
-                  <>
-                    <button className="alert-popup-action-btn resolve" onClick={() => resolveAlert(selectedAlert.id)}>✅ Çözüldü İşaretle</button>
-                    <button className="alert-popup-action-btn false-positive" onClick={() => markFalse(selectedAlert.id)}>🚫 Hatalı Alarm İşaretle</button>
-                  </>
-                )}
-                <button className="alert-popup-action-btn export" onClick={() => shareAlert(selectedAlert)}>📤 Kopyala (Share)</button>
-              </div>
-            </div>
-          </div>
-        </div>
+        <AlertDetailModal
+          alert={selectedAlert}
+          alertView={alertView}
+          onClose={() => setSelectedAlert(null)}
+          onResolve={resolveAlert}
+          onMarkFalse={markFalse}
+          onShare={shareAlert}
+        />
       )}
 
-      {/* ═══════ MODAL: Correlation Deep Dive ═══════ */}
       {selectedCorrelation && (
-        <div className="modal-overlay" onClick={() => setSelectedCorrelation(null)}>
-          <div className="modal-content" onClick={e => e.stopPropagation()} style={{ maxWidth: 720 }}>
-            <div className="modal-header" style={{ background: 'linear-gradient(135deg, rgba(57,210,192,0.1), rgba(13,17,23,0.8))' }}>
-              <span className="modal-title" style={{ color: 'var(--accent-cyan)' }}>🔗 Korelasyon: {selectedCorrelation.group_id}</span>
-              <div style={{ display: 'flex', gap: 12 }}>
-                <button className="corr-view-btn" onClick={() => shareCorrelation(selectedCorrelation)}>📤 Kopyala</button>
-                <button className="modal-close" onClick={() => setSelectedCorrelation(null)}>✕</button>
-              </div>
-            </div>
-            <div className="modal-body">
-              <div style={{ padding: '12px 16px', background: 'var(--bg-terminal)', borderRadius: 8, border: '1px solid var(--border-primary)', marginBottom: 8 }}>
-                <div style={{ fontSize: '0.95rem', fontWeight: 600, color: 'var(--text-primary)' }}>{selectedCorrelation.chain_label}</div>
-              </div>
-              {selectedCorrelation.impact_summary && (
-                <div style={{ padding: '12px 16px', background: 'rgba(240,136,62,0.05)', borderRadius: 8, border: '1px solid rgba(240,136,62,0.15)', borderLeft: '3px solid var(--accent-orange)' }}>
-                  <div style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>{selectedCorrelation.impact_summary}</div>
-                </div>
-              )}
-              <div className="modal-divider" style={{ margin: '12px 0' }}></div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 8, maxHeight: 300, overflowY: 'auto' }}>
-                {selectedCorrelation.events.map((evt, i) => (
-                  <div key={i} style={{ display: 'flex', gap: 12, padding: '10px 12px', background: 'var(--bg-card-hover)', borderRadius: 6, border: '1px solid var(--border-primary)' }}>
-                    <div style={{ flex: 1 }}>
-                      <div style={{ display: 'flex', gap: 8, marginBottom: 4, alignItems: 'center' }}>
-                        <span style={{ fontSize: '0.7rem', color: 'var(--text-dim)' }}>{fmtTime(evt.timestamp)}</span>
-                        <span className={`log-level-badge ${evt.level}`} style={{ fontSize: '0.6rem' }}>{evt.level}</span>
-                        <span style={{ fontSize: '0.7rem', color: 'var(--accent-purple)', fontWeight: 600 }}>{evt.source}</span>
-                      </div>
-                      <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>{evt.message}</div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          </div>
-        </div>
+        <CorrelationModal
+          correlation={selectedCorrelation}
+          onClose={() => setSelectedCorrelation(null)}
+          onShare={shareCorrelation}
+        />
       )}
 
-      {/* ═══════ MODAL: System Management ═══════ */}
       {showSystemModal && (
-        <div className="sys-modal-overlay" onClick={() => setShowSystemModal(false)}>
-          <div className="sys-panel" onClick={e => e.stopPropagation()}>
-            <div className="sys-panel-header">
-              <div className="sys-panel-title-group">
-                <div className="sys-panel-icon">⚙️</div>
-                <div>
-                  <div className="sys-panel-title">Sistem Yönetimi & Bakım</div>
-                  <div className="sys-panel-subtitle">LogSense AI çekirdek yapılandırması</div>
-                </div>
-              </div>
-              <button className="sys-close-btn" onClick={() => setShowSystemModal(false)}>✕</button>
-            </div>
-
-            <div className="sys-tab-bar">
-              <button className={`sys-tab ${systemTab === 'settings' ? 'active' : ''}`} onClick={() => setSystemTab('settings')}>Genel Ayarlar</button>
-              <button className={`sys-tab ${systemTab === 'backups' ? 'active' : ''}`} onClick={() => setSystemTab('backups')}>Yedeklemeler</button>
-              <button className={`sys-tab ${systemTab === 'maintenance' ? 'active' : ''}`} onClick={() => setSystemTab('maintenance')}>Sistem Bakımı</button>
-            </div>
-
-            <div className="sys-body">
-              {systemTab === 'settings' && (
-                <div className="fade-in">
-                  <div className="sys-config-card">
-                    <div className="sys-config-header">
-                      <div>
-                        <div className="sys-config-title">Log Saklama Süresi</div>
-                        <div className="sys-config-desc">Veritabanında tutulacak maksimum log yaşı.</div>
-                      </div>
-                      <div className="sys-retention-badge">{systemSettings.retention_days} Gün</div>
-                    </div>
-                    <div className="sys-slider-container">
-                      <input type="range" min="1" max="90" className="sys-slider" value={systemSettings.retention_days}
-                        onChange={e => setSystemSettings(s => ({ ...s, retention_days: Number(e.target.value) }))}
-                        style={{ '--v': systemSettings.retention_days } as any} />
-                      <div className="sys-slider-labels"><span>1G</span><span>30G</span><span>60G</span><span>90G</span></div>
-                    </div>
-                  </div>
-
-                  <div className="sys-config-card" style={{ marginTop: 16 }}>
-                    <div className="sys-config-header">
-                      <div>
-                        <div className="sys-config-title">Otomatik Yedekleme</div>
-                        <div className="sys-config-desc">Her gece saat 00:00'da sistem yedeği alınır.</div>
-                      </div>
-                      <label className="sys-toggle">
-                        <input type="checkbox" checked={systemSettings.auto_backup}
-                          onChange={e => setSystemSettings(s => ({ ...s, auto_backup: e.target.checked }))} />
-                        <span className="sys-toggle-track"><span className="sys-toggle-thumb"></span></span>
-                      </label>
-                    </div>
-                  </div>
-                  <button className="sys-save-btn" style={{ marginTop: 24 }} onClick={() => updateSystemSettings(systemSettings)}>Değişiklikleri Kaydet</button>
-                </div>
-              )}
-
-              {systemTab === 'backups' && (
-                <div className="fade-in">
-                  <div className="sys-backups-header">
-                    <div className="sys-backups-title">Mevcut Yedekler (CSV.GZ)</div>
-                    <button className="sys-refresh-btn" onClick={fetchBackups}>🔄 Yenile</button>
-                  </div>
-                  <div className="sys-backup-grid">
-                    {backups.length === 0 ? (
-                      <div className="sys-backup-empty">
-                        <div className="sys-backup-empty-icon">📁</div>
-                        <div className="sys-backup-empty-text">Arşiv Boş</div>
-                        <div className="sys-backup-empty-hint">Henüz sistem yedeği oluşturulmamış.</div>
-                      </div>
-                    ) : backups.map((b, i) => (
-                      <div key={b.filename} className="sys-backup-card">
-                        <div className="sys-backup-card-top">
-                          <span className="sys-backup-number">#{backups.length - i}</span>
-                          <span className="sys-backup-size-badge">{b.size_mb} MB</span>
-                        </div>
-                        <div className="sys-backup-card-icon">📦</div>
-                        <div className="sys-backup-card-name" title={b.filename}>{b.filename}</div>
-                        <div className="sys-backup-card-date">{new Date(b.created_at).toLocaleDateString()}</div>
-                        <div className="sys-backup-card-actions">
-                          <button className="sys-backup-btn download" onClick={() => downloadBackup(b.filename)}>İndir</button>
-                          <button className="sys-backup-btn delete" onClick={() => deleteBackup(b.filename)}>✕</button>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {systemTab === 'maintenance' && (
-                <div className="fade-in">
-                  <div className="sys-maintenance-card">
-                    <div>
-                      <div className="sys-maintenance-title">Manuel Arşivleme & Temizlik</div>
-                      <div className="sys-maintenance-desc">Tüm eski logları hemen yedekle ve veritabanını optimize et.</div>
-                    </div>
-                    <button className={`sys-run-btn ${isMaintenanceRunning ? 'loading' : ''}`}
-                      onClick={triggerMaintenance} disabled={isMaintenanceRunning}>
-                      {isMaintenanceRunning ? '🔄 Çalışıyor...' : '⚡ Başlat'}
-                    </button>
-                  </div>
-                </div>
-              )}
-            </div>
-            {systemToast && (
-              <div className={`sys-toast ${systemToast.type}`}>
-                {systemToast.type === 'success' ? '✅' : '❌'} {systemToast.msg}
-              </div>
-            )}
-          </div>
-        </div>
+        <SystemSettingsModal
+          systemTab={systemTab}
+          setSystemTab={setSystemTab}
+          systemSettings={systemSettings}
+          setSystemSettings={setSystemSettings}
+          backups={backups}
+          isMaintenanceRunning={isMaintenanceRunning}
+          systemToast={systemToast}
+          onClose={() => setShowSystemModal(false)}
+          onSaveSettings={updateSystemSettings}
+          onFetchBackups={fetchBackups}
+          onDownloadBackup={downloadBackup}
+          onDeleteBackup={deleteBackup}
+          onTriggerMaintenance={triggerMaintenance}
+        />
       )}
     </div>
   );
