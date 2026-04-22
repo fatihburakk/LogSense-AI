@@ -1,0 +1,61 @@
+name: LogSense AI Dağıtım (K3s)
+
+on:
+  push:
+    branches: [ main ] # Branch isminiz farklıysa burayı değiştirin (örn: master)
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Kodu Çek
+        uses: actions/checkout@v4
+
+      - name: GitHub Container Registry'ye Giriş Yap
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Backend İmajını Oluştur ve Yükle
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/logsense-backend:latest
+
+      - name: Frontend İmajını Oluştur ve Yükle
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/logsense-frontend:latest
+          build-args: |
+            NEXT_PUBLIC_API_URL=http://${{ secrets.SERVER_IP }}:30000
+
+      - name: Sunucuya Dağıtım Yap (SSH)
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_IP }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            # Çalışma dizinine git (yoksa oluştur)
+            mkdir -p ~/logsense-deploy
+            cd ~/logsense-deploy
+            
+            # Deployment dosyasını sunucuya kopyalamak yerine doğrudan buradan oluşturabiliriz
+            # veya scp-action kullanabiliriz. En temizi echo ile yazmak veya git pull yapmaktır.
+            # Şimdilik en hızlı yöntem: Deployment dosyasını güncelle ve uygula.
+            cat <<EOF > deployment.yaml
+            $(cat deployment.yaml | sed "s/<SUNUCU_IP>/${{ secrets.SERVER_IP }}/g")
+            EOF
+            
+            kubectl apply -f deployment.yaml
+            kubectl rollout restart deployment backend -n logsense
+            kubectl rollout restart deployment frontend -n logsense
