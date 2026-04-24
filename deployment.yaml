@@ -57,7 +57,6 @@ spec:
             secretKeyRef:
               name: logsense-secrets
               key: LOGSENSE_API_KEY
-        # 2GB RAM için bekleme sürelerini artırdık
         livenessProbe:
           httpGet:
             path: /
@@ -132,10 +131,11 @@ metadata:
   name: frontend-service
   namespace: logsense
 spec:
-  type: LoadBalancer
+  type: NodePort # LoadBalancer yerine NodePort'a geçtik
   selector:
     app: frontend
   ports:
   - protocol: TCP
-    port: 80
+    port: 3000
     targetPort: 3000
+    nodePort: 30001 # Frontend artık bu porttan açılacak
