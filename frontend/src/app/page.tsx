@@ -287,7 +287,7 @@ export default function Dashboard() {
           headers: { "Content-Type": "application/json", "X-API-KEY": API_KEY },
           body: JSON.stringify({ ...err, timestamp: new Date().toISOString() }),
         });
-      } catch {}
+      } catch { }
       await new Promise((r) => setTimeout(r, 500));
     }
     setSending(false);
